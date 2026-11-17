@@ -1,0 +1,24 @@
+# 此模板同时提供默认值；.config 中未设置或留空的参数使用这些值。
+# 同名系统环境变量优先于 .config；字节数、Token 数和优先级均为正整数。
+
+# Phase 1：最多扫描 8 MiB，单条原始事件最多 1 MiB。
+MEMORY_PHASE1_MAX_READ_BYTES=8388608
+MEMORY_PHASE1_MAX_RECORD_BYTES=1048576
+
+# 最终输入的字节上限和 Token 预算同时生效。
+MEMORY_PHASE1_MAX_ROLLOUT_BYTES=8388608
+# W 从根目录 .env 的 DEEPSEEK_CONTEXT_WINDOW 读取，B=floor(W × 此比例)。
+# 比例必须大于 0 且不超过 1。
+input_budget_ratio=0.7
+
+# 单条格式化记录的字节上限，以及工具输出的近似 Token 上限。
+MEMORY_PHASE1_MAX_ROW_BYTES=10000
+MEMORY_PHASE1_TOOL_OUTPUT_TOKENS=2000
+
+# 默认按每 4 个 UTF-8 字节估算 1 Token。
+MEMORY_BYTES_PER_TOKEN=4
+
+# 数字越小越优先，可调整顺序；相同优先级按 seq 新近程度筛选。
+MEMORY_PRIORITY_USER=1
+MEMORY_PRIORITY_ASSISTANT=2
+MEMORY_PRIORITY_TOOL=3

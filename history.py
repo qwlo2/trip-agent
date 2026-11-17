@@ -9,8 +9,6 @@ from enum import Enum
 from pathlib import Path
 from typing import Any
 
-from tokens import Tokens
-
 
 class TurnEndReason(str, Enum):
     """问答结束原因：正常完成、执行异常或达到步骤上限。"""
@@ -70,7 +68,6 @@ class HistoryStore:
     def append(self, events: list[dict[str, Any]]) -> list[dict[str, Any]]:
         """给新增事件分配全局递增的 seq，并追加到 JSONL，返回已编号的事件。
 
-        message 事件增加 tokens 字段；有 usage 时使用服务端输出用量，否则估算。
         调用方传入 type、turn、step 等事件字段；编号在写入成功后递增。
         每次写入后 flush 并 fsync，不重写已有事件。
         """
@@ -79,8 +76,6 @@ class HistoryStore:
         records = []
         for index, event in enumerate(events):
             record = {**event, "seq": self._next_seq + index}
-            if event["type"] in {"message", "compaction/summary"}:
-                record["tokens"] = Tokens.count(event["message"], event.get("usage"))
             records.append(record)
         content = "".join(json.dumps(record, ensure_ascii=False) + "\n" for record in records)
         self.path.parent.mkdir(parents=True, exist_ok=True)

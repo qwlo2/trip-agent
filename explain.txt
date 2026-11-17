@@ -7,25 +7,15 @@ agent:
  tool-execute(通过回答来调用工具，并且需要提供可选工具给llm，并根据需要调用tool)
  converssation-history(历史记录，每次都追加新信息)->memory
 
-session:
+session:（session为基本单位，object为几个session共同单位）
 tokens
 history
 compact：
 context-build
+memmory
 
 
-1.1、记忆模块
-
- 后面暂时定为根据 converssation-history来提取记忆（工作，情景，语义，感知）
-
- 暂时只考虑情景和语义记忆
-
- 暂定设置token限制，滑动窗口，用户要求三种方式触发
-
-1.2或许可以结合，达到token限制后根据message，将窗口内部分append为记忆，暂定通过直接喂给llm
-让他来提取进而持久化，来模拟窗口
-
-1.2、session
+1.1、session
 Chat Completions API,会话对于llm是不存在的，它只是单纯根据上下文进行推理，session是在agent中
 
 API 类型	会话状态管理
@@ -33,20 +23,180 @@ Chat Completions	通常由调用方传入完整消息历史
 Responses API	支持通过 previous_response_id 延续响应上下文
 Conversations API	支持服务端管理持久化对话状态
 
+1.2 history
+  
+采用事件日志，将用户输入，llm输出，每个工具调用作为一次seq，
+给LLM的message数据结构如下：
+rule：user
+context：
+
+rule：assistant
+context：
+call-tools：
+
+rule：tool
+tool_call_id：
+context：
+
+写入event_log要额外加入seq，turn，step，seq是promote不变，
+对于LLM的回答还要增加元数据（也就是回答自带了元数据字段）等
+其中turn代表一次问答，并且要记录tuen-start/end
+如下:
+{"seq":0,"type":"message","turn":0,"message":{"role":"system","content":"你是导游。"}}
+{"seq":1,"type":"turn/start","turn":1}
+{"seq":2,"type":"message","turn":1,"message":{"role":"user","content":"你好"}}
+{"seq":3,"type":"step/start","turn":1,"step":1}
+{"seq":4,"type":"message","turn":1,"step":1,"message":{"role":"assistant","content":"你好！"},"usage":{"prompt_tokens":20,"completion_tokens":4,"total_tokens":24}}
+{"seq":5,"type":"step/end","turn":1,"step":1}
+{"seq":6,"type":"turn/end","turn":1,"reason":"completed"}
+
+加载session是会从头到尾提取所有seq中的message并组织，遇到摘要就进行替换
+
+在加载时会预计通过turn-start/end的对应进行判断是否中断了，
+如果是，进行恢复则可以通过turn-end来进行恢复，也就是进行一轮问答
+
 1.3上下文窗口，compress
    
    当history超过comoress要进行压缩，因此要将摘要也追加到history，考虑重启后如何恢复上下文。
    
    history的变化
    由于要将记录量化做到区分不同记录，增加seq和turn，每一次完整的对话称为turn
-   1、可以将摘要单独保存，每次都读取文件然后，然后就可以获取摘要之后哪些seq并未comress，再进行随机读取
+   1、可以将摘要单独保存，每次都读取文件然后，然后就可以获取摘要之后哪些seq并没有comress，再进行随机读取
    2、则是将compress也作为history记录，然后顺序读取整个history，每到comress就替换相应的seq
    但是1存储多个不同文件持久化一致的问题，维护困难，暂时采用2
 
-   compress：
+compact：
 
-    comress在history中同样采用追加，但在message中采用replace，将压缩的seq进行替换，
+   comress在history中同样采用追加，但在message中采用replace，将压缩的seq进行替换，
    compress时为了保证tool call和tool resultt联系应该要一起compress
+
+采用正向扫描构建缓存+反向定位
+正向：
+构建缓存：interface BalanceCache {
+    generation: number;缓存是否有效
+
+    cutBalanced: readonly boolean[];n个surface有n+1个node
+
+    indexBySeq: Map<SessionSeq, number>;反向定位通过seq获取在surface的位置从而判断是否安全
+
+    inProgressToolCalls: number;tool-result不一定全部返回，此时将pendig记住配合eventDelta()增量更新位置
+}
+
+反向：
+通过不断估计token，达到限制k之后，通过seq得到node的位置，再由cutBalanced判断是否安全
+这里构建2个函数，判断node前后是否安全，也就是分别查看【node】和【node+1】就可以是实现前后的概念
+
+摘要：
+压缩后的摘要也追加到history，参与seq计算，并且要附带说明这是哪些seq压缩而成；
+在message中采用replace，将摘要和被压缩的seq替换，保证信息顺序不变；重启时，
+message通过读取文件组织seq而来，当遇到压缩的seq，也效仿之前的进行替换，也就是顺序读取，
+并不断替换，最终得到完整的mwssage；最后在tool中注册压缩工具，当用户要求压缩时，
+llm通过tool-call进行
+
+token估算：
+采用UTF8，4字节估算，
+T=min（WR，W-o-b）取下
+k=（w-o）r取下
+W：当前模型的 Context Window。
+r：压缩触发比例，沿用 DSH 的策略。
+O：输出预留，设置为当前模型支持的最大输出 Token。
+B：安全预留，同样设置为当前模型支持的最大输出 Token。
+
+
+
+1.4、记忆模块
+
+    设定为局部记忆和全局记忆，局部即是session的提炼，开始、过程和结果，全局记忆是用户画像，即
+用户偏好，项目经历，以及各种约束
+
+存储结构：
+    event-log
+    局部记忆-sqlite(通过数据库管理元数据，记录使用次数等，也方便提权来压缩全局)
+    （增加变量标记是否参与全局提取）
+    全局记忆-md
+
+phase1：
+      会从event-log中筛选seq，从文件末尾反向扫描，筛选按事件类型先分优先级，
+      事件优先级如下（从高到底）：
+         User Message、Assistant Message  ，tool-call/tool-result
+         （原始 Event 中如果一个 Assistant Message 同时包含文本和多个 Tool Calls，
+         可以将它拆成多个 MemoryItem，但共享同一个来源 seq ）
+      读取大小限制如下：
+         max_rollout_bytes	8 MiB	本次从 Session 中保留的有效历史总预算
+         max_record_bytes	1 MiB	单条原始 Event 的大小上限
+         tool_output_tokens	2,000	单条 Tool Result 的近似截断目标
+         max_row_bytes	10,000	单条序列化记录的大小上限
+      也就是读取8MB的数据并区分优先级，将其转化为统一MemoryItem，在读取时只记录原始数据，
+      再根据优先级选择数据，再进行格式化并估计token，采用4字节近似法（格式化的格式参照正常输入到LLM的message格式，
+      但是role变为 User Message、Assistant Message  ，tool-call/tool-result）
+      同优先级按seq选择（这里工具调用和结果仍按 call_id 成组选取，
+      所以较新的结果可能带入较旧的调用），最后将所有seq按顺序排列，总大小要在上下文限制内
+      对上下文也有限制;
+       B=w乘以input_budget_ratio`取下
+        input_budget_ratio=0.7
+      llm生成的结构将sqlite中的旧文件覆盖，即update
+
+      sqlite的2张表存储在schema.sql下：
+      stage1-outputs存储局部记忆，筛选时通过last-completed-seq来充当10d的限制
+      通过在追加seq的循坏中记录last-completed-seq，当一轮turn结束时进行追加sqlite
+      因此只有在turn中途奔溃时会不完整，此时的turn对于记忆没有帮助
+      （或许可以通过记忆恢复来解决）
+      每个turn之间相隔时差可能会很大，但是未完成的turn没有意义，因此代替phase1的活跃事件限制来筛选session
+
+       memory_jobs表是phase1，2的任务控制，用来判断是否成功以及限制只有一个worker进行提取
+ 
+文件修改方式：
+  phase1：将sqlite中的旧文件覆盖，即update
+  phase2：采用这个框架，通过git得出增删改，然后将哪些文件增删改，以及原本的memory在memory-agent中通过llm
+  进行整合，由llm根据文件增删改的变化，判断是否要更改记忆，随后通过tool来进行改变
+
+ ~/.codex/memories_v2/
+├── rollout_summaries/
+│   ├── session_001.md
+│   ├── session_002.md
+│   ├── ...
+│   └── session_256.md
+├── memory_summary.md
+└── .git/
+
+触发条件：
+    参考codex的方案，采取parse1.2的方式
+    codex的触发要求重新启动后必须开启新对话才开始phase1，提取记忆
+    项目删去必须开启新对话的要求，当重新启动后，从sqlite中筛选符合条件的局部记忆
+    条件：
+    phare1：活动时间必须在10天内，必须空闲6小时，只提取使用次数最多的2个session，额度在25%
+    phare2:提取256条局部，必须在30天内活跃，每次全局的提取间隔6小时，数据库只能重试3次
+
+Agent 运行中
+    │
+    ├── Session A：持续追加 Event Log
+    ├── Session B：持续追加 Event Log
+    └── Compaction：按 Token 阈值执行
+    │
+    ▼
+Agent 进程结束
+    │
+    ▼
+Agent 重新启动
+    │
+    ├── 恢复 Session / History / Surface
+    │
+    └── 启动 Memory Pipeline
+           │
+           ▼
+       查询待提取历史
+           │
+           ▼
+       Phase 1：Local Extraction
+           │
+           ▼
+       提交 Local Memory
+           │
+           ▼
+       Phase 2：Global Consolidation
+           │
+           ▼
+       更新 Global Memory
 
 
 二、响应解析和报文
@@ -100,45 +250,4 @@ class Message:（前三个与llm返回的一致，id区分不同session    metad
     metadata: dict[str, Any] = field(
         default_factory=dict
     )
-
-
-创建compaction-basic目录，新增compact类，当上下文触发限制T时对上下文进行压缩，
-T的设置如图片所示，安全预留和输出预留采取模型最大输出token，其他具体数值先不填写，
-；当message的token>=T，则从末尾开始计算token并和K比较，k的值用第二张图计算，
-当超过K后，通过enentDelta（event）判断当前是否可以作为分界点，将这以前的seq进行压缩，
-seq0不参与；
-
-
-token估算：
-采用UTF8，4字节估算，
-T=min（WR，W-o-b）取下
-k=（w-o）r取下
-W：当前模型的 Context Window。
-r：压缩触发比例，沿用 DSH 的策略。
-O：输出预留，设置为当前模型支持的最大输出 Token。
-B：安全预留，同样设置为当前模型支持的最大输出 Token。
-
-compact：
-采用正向扫描构建缓存+反向定位
-正向：
-构建缓存：interface BalanceCache {
-    generation: number;缓存是否有效
-
-    cutBalanced: readonly boolean[];n个surface有n+1个node
-
-    indexBySeq: Map<SessionSeq, number>;反向定位通过seq获取在surface的位置从而判断是否安全
-
-    inProgressToolCalls: number;tool-result不一定全部返回，此时将pendig记住配合eventDelta()增量更新位置
-}
-
-反向：
-通过不断估计token，达到限制k之后，通过seq得到node的位置，再由cutBalanced判断是否安全
-这里构建2个函数，判断node前后是否安全，也就是分别查看【node】和【node+1】就可以是实现前后的概念
-
-摘要：
-压缩后的摘要也追加到history，参与seq计算，并且要附带说明这是哪些seq压缩而成；
-在message中采用replace，将摘要和被压缩的seq替换，保证信息顺序不变；重启时，
-message通过读取文件组织seq而来，当遇到压缩的seq，也效仿之前的进行替换，也就是顺序读取，
-并不断替换，最终得到完整的mwssage；最后在tool中注册压缩工具，当用户要求压缩时，
-llm通过tool-call进行
 

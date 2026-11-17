@@ -1,11 +1,8 @@
 """命令行导游问答入口。"""
 
-import os
 from math import floor, isfinite
 from pathlib import Path
 from typing import Any
-
-from dotenv import dotenv_values
 
 from agent import GuideAgent, SYSTEM_PROMPT
 from client import Trip_Client
@@ -13,26 +10,31 @@ from compact import Compact
 from context_builder import ContextBuilder
 from history import HistoryStore
 from session import Session
+from settings_loader import convert_settings, load_settings
 from tool_executor import ToolExecutor
 
 
-def load_compact_settings(settings: dict[str, Any]) -> dict[str, Any]:
-    """统一读取、转换并校验环境中的容量与比例，返回 Compact 的关键字参数。"""
+def load_compact_settings(settings: dict[str, Any] | None = None) -> dict[str, Any]:
+    """通过公共加载器获取容量及比例，校验业务约束并返回 Compact 的关键字参数。
+
+    可传入配置字典进行转换；未传时读取根目录 .env，并使用 .env.example 默认值。
+    """
     fields = {
         "DEEPSEEK_CONTEXT_WINDOW": ("context_window", int),
         "DEEPSEEK_MAX_OUTPUT_TOKENS": ("max_output_tokens", int),
         "COMPACT_THRESHOLD_RATIO": ("threshold_ratio", float),
         "COMPACT_RETAIN_RATIO": ("retain_ratio", float),
     }
-    values = {}
-    for name, (parameter, convert) in fields.items():
-        raw = settings.get(name)
-        if raw is None or str(raw).strip() == "":
-            raise ValueError(f"缺少必填配置：{name}")
-        try:
-            values[parameter] = convert(raw)
-        except (TypeError, ValueError) as error:
-            raise ValueError(f"配置格式错误：{name}={raw!r}") from error
+    converters = {name: convert for name, (_, convert) in fields.items()}
+    if settings is None:
+        converted = load_settings(
+            path=Path(__file__).with_name(".env"),
+            defaults_path=Path(__file__).with_name(".env.example"),
+            fields=converters,
+        )
+    else:
+        converted = convert_settings(settings, converters)
+    values = {parameter: converted[name] for name, (parameter, _) in fields.items()}
     for name in ("context_window", "max_output_tokens"):
         if values[name] <= 0:
             raise ValueError(f"{name} 必须为正整数")
@@ -56,8 +58,7 @@ def main() -> None:
     executor = ToolExecutor()
     history = HistoryStore()
     context = ContextBuilder()
-    settings = {**dotenv_values(Path(__file__).with_name(".env")), **os.environ}
-    compact_settings = load_compact_settings(settings)
+    compact_settings = load_compact_settings()
     with Trip_Client() as client:
         compact = Compact(client, **compact_settings)
         session = Session(history, context, SYSTEM_PROMPT, compact)

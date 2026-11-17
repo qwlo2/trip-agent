@@ -3,14 +3,13 @@
 from __future__ import annotations
 
 import json
-import os
 from copy import deepcopy
 from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import urlencode
 from urllib.request import urlopen
 
-from dotenv import dotenv_values
+from settings_loader import load_settings
 
 
 class ToolExecutor:
@@ -29,12 +28,14 @@ class ToolExecutor:
 
         高德 Key 在实际请求时校验，未填写时仍可注册和执行其他工具。
         """
-        config = {
-            **dotenv_values(env_file or Path(__file__).with_name(".env")),
-            **os.environ,
-        }
-        self._amap_key = (config.get("AMAP_API_KEY") or "").strip()
-        self._timeout = float(config.get("AMAP_TIMEOUT") or "15")
+        config = load_settings(
+            path=env_file or Path(__file__).with_name(".env"),
+            defaults_path=Path(__file__).with_name(".env.example"),
+            fields={"AMAP_API_KEY": str, "AMAP_TIMEOUT": float},
+            allow_empty=("AMAP_API_KEY",),
+        )
+        self._amap_key = config["AMAP_API_KEY"]
+        self._timeout = config["AMAP_TIMEOUT"]
         self._tools: dict[str, tuple[dict[str, Any], Callable[..., Any]]] = {}
 
         pagination = {

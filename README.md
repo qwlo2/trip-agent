@@ -9,12 +9,13 @@ Python 3.10+。中文导游问答 Agent，支持高德工具、多轮对话和�
 `.env.example` 为可提交的配置模板。系统环境变量优先于 `.env`；
 `DEEPSEEK_TIMEOUT` 和 `AMAP_TIMEOUT` 单位均为秒。
 
-压缩配置为必填，不内置模型容量或比例默认值：
+压缩配置由 `.env` 指定，缺省值取自 `.env.example`，模板采用 DSH 默认配置：
+`W=1000000`、`O=B=256000`、`r=0.8`、`k=0.16`。
 
 | 配置项 | 含义 |
 | --- | --- |
-| `DEEPSEEK_CONTEXT_WINDOW` | 当前 `DEEPSEEK_MODEL` 的 Context Window，即 W |
-| `DEEPSEEK_MAX_OUTPUT_TOKENS` | 当前模型支持的最大输出容量，同时用作 O 和 B |
+| `DEEPSEEK_CONTEXT_WINDOW` | 使用的上下文窗口预算 W，不超过模型支持的容量 |
+| `DEEPSEEK_MAX_OUTPUT_TOKENS` | 单次请求的输出上限，同时用作 O 和 B，不超过模型支持的容量 |
 | `COMPACT_THRESHOLD_RATIO` | 触发比例 r，介于 0 和 1 之间 |
 | `COMPACT_RETAIN_RATIO` | 近期保留比例 k，介于 0 和 r 之间 |
 
@@ -102,19 +103,10 @@ Agent 先用 `Session.append_history()` 获取实际 seq，再用 `append_contex
 普通 Append 不改变 `replace_generation`；Replace 和清空操作使结构版本递增。
 turn、step 等日志事件不进入模型请求。
 
-消息 token 由 `tokens.py` 的 `Tokens.count(message, usage=None)` 计算，
-写入新增 `message` 事件的 `tokens` 字段：
-
-- LLM 返回 `usage` 时，使用 `completion_tokens` 作为该 assistant 消息的 token 数，
-  完整 `usage` 同时保存在事件顶层，便于查看请求输入、输出和总用量。
-- 系统、用户、工具消息，以及没有 `usage` 的模型消息，按原始消息的紧凑 JSON
-  UTF-8 字节数除以 4 向上取整估算：`(byte_count + 3) // 4`。
-- 估算包含消息自身的角色、正文、推理内容和工具调用等字段，
-  不计事件的 `turn`、`step`、`seq` 等字段。边界事件不计 token。
-
-消息级 `tokens` 之和不代表 API 请求累计用量：请求会重复发送已有上下文。
-统计实际请求用量时应累计每次响应的 `usage.total_tokens`，避免与消息估算相加。
-已有历史保持原样，只有新增记录写入 token 数据。
+History 仅保存事件数据，LLM 响应的完整 `usage` 保存在事件顶层，
+用于查看请求输入、输出和总用量。运行时的消息 Token 统计由 `tokens.py`
+负责，Memory 候选项的 `token_count` 在脱敏、截断和格式化后计算。
+统计实际请求累计用量时应累加每次响应的 `usage.total_tokens`。
 
 `session.tokens.total_tokens` 缓存当前上下文用量，按以下规则实时更新：
 
@@ -134,8 +126,11 @@ turn、step 等日志事件不进入模型请求。
 
 `Compact(client, context_window=..., max_output_tokens=..., threshold_ratio=..., retain_ratio=...)`
 使用现有同步 Client，由 Session 持有。Compact 不保存 Session，执行时临时接收 session 参数。
-配置统一放在 `.env`，由 `main.py` 的 `load_compact_settings()`
-读取并校验后作为关键字参数传入：
+配置放在 `.env`，由根目录 `settings_loader.py` 统一读取并转换类型，
+使用 `.env.example` 提供缺省值；`main.py` 的 `load_compact_settings()`
+负责业务约束校验并组装构造参数。Memory 使用同一加载器读取
+`memory/.config`，默认值来自 `memory/.config.example`。
+同名系统环境变量优先，未设置或留空的参数使用模板默认值：
 
 - 初始化时直接计算并保存 `threshold`（T）、`retain_tokens`（K）。
 - `compact_if_needed(session)`：通过 Session 计量实际请求，达到 T 后启动压缩。

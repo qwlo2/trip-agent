@@ -3,14 +3,14 @@
 from __future__ import annotations
 
 import json
-import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Sequence
 
-from dotenv import dotenv_values
 from openai import OpenAI
 from openai.types.chat import ChatCompletion
+
+from settings_loader import load_settings
 
 
 @dataclass
@@ -61,21 +61,23 @@ class Trip_Client:
                 同名系统环境变量优先于文件配置。
 
         Raises:
-            ValueError: API Key 为空或超时时间无法转换为数字。
+            ValueError: 缺少必填配置或配置类型转换失败。
         """
-        config = {
-            **dotenv_values(env_file or Path(__file__).with_name(".env")),
-            **os.environ,
-        }
-        api_key = (config.get("DEEPSEEK_API_KEY") or "").strip()
-        if not api_key:
-            raise ValueError("请在 .env 或系统环境变量中设置 DEEPSEEK_API_KEY")
-
-        self.model = config.get("DEEPSEEK_MODEL") or "deepseek-flash"
+        config = load_settings(
+            path=env_file or Path(__file__).with_name(".env"),
+            defaults_path=Path(__file__).with_name(".env.example"),
+            fields={
+                "DEEPSEEK_API_KEY": str,
+                "DEEPSEEK_BASE_URL": str,
+                "DEEPSEEK_MODEL": str,
+                "DEEPSEEK_TIMEOUT": float,
+            },
+        )
+        self.model = config["DEEPSEEK_MODEL"]
         self._api = OpenAI(
-            api_key=api_key,
-            base_url=config.get("DEEPSEEK_BASE_URL") or "https://api.deepseek.com",
-            timeout=float(config.get("DEEPSEEK_TIMEOUT") or "60"),
+            api_key=config["DEEPSEEK_API_KEY"],
+            base_url=config["DEEPSEEK_BASE_URL"],
+            timeout=config["DEEPSEEK_TIMEOUT"],
             max_retries=0,
         )
 
