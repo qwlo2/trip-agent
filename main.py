@@ -6,10 +6,8 @@ from typing import Any
 
 from agent import GuideAgent, SYSTEM_PROMPT
 from client import Trip_Client
-from compact import Compact
-from context_builder import ContextBuilder
-from history import HistoryStore
 from session import Session
+from session_manager import SESSION_PAGE_SIZE, SessionManager
 from settings_loader import convert_settings, load_settings
 from tool_executor import ToolExecutor
 
@@ -53,26 +51,68 @@ def load_compact_settings(settings: dict[str, Any] | None = None) -> dict[str, A
     return values
 
 
+def create_session(manager: SessionManager) -> Session:
+    """询问会话名称并创建新的会话。"""
+    name = input("会话名称（回车使用默认名称）：").strip()
+    return manager.create(name or "新会话")
+
+
+def select_session(manager: SessionManager) -> Session | None:
+    """每页展示有限数量的会话，返回用户选择的会话，退出时返回 None。"""
+    offset = 0
+    while True:
+        sessions = manager.get_sessions(offset=offset)
+        if not sessions and offset:
+            print("没有更多会话。")
+            offset -= SESSION_PAGE_SIZE
+            continue
+
+        choices = {}
+        print(f"会话列表 · 第 {offset // SESSION_PAGE_SIZE + 1} 页")
+        for number, item in enumerate(sessions, start=1):
+            choices[str(number)] = item["session_id"]
+            print(f"  {number}. {item['name']}（打开 {item['usage']} 次）")
+        prompt = ["0 新建", "exit 退出"]
+        if offset:
+            prompt.append("p 上一页")
+        if len(sessions) == SESSION_PAGE_SIZE:
+            prompt.append("n 下一页")
+        choice = input(f"请选择会话（{'，'.join(prompt)}）：").strip().lower()
+        if choice in choices:
+            return manager.open(choices[choice])
+        if choice == "0":
+            return create_session(manager)
+        if choice in {"exit", "quit"}:
+            return None
+        if choice == "p" and offset:
+            offset -= SESSION_PAGE_SIZE
+        elif choice == "n" and len(sessions) == SESSION_PAGE_SIZE:
+            offset += SESSION_PAGE_SIZE
+        else:
+            print("请输入列表中的会话编号或命令。")
+
+
 def main() -> None:
-    """启动导游对话；/compact 手动压缩，/clear 清空历史，exit 或 quit 退出。"""
-    executor = ToolExecutor()
-    history = HistoryStore()
-    context = ContextBuilder()
+    """选择会话后启动导游对话，支持切换会话、压缩和新建。"""
     compact_settings = load_compact_settings()
     with Trip_Client() as client:
-        compact = Compact(client, **compact_settings)
-        session = Session(history, context, SYSTEM_PROMPT, compact)
-        agent = GuideAgent(client, executor, session)
-        print("导游已就绪。/compact 压缩上下文，/clear 清空历史，exit 退出。")
+        manager = SessionManager(client, SYSTEM_PROMPT, compact_settings)
+        session = select_session(manager)
+        if session is None:
+            return
+        agent = GuideAgent(client, ToolExecutor(), session)
+        print("导游已就绪。/sessions 切换会话，/clear 新建会话，/compact 压缩上下文，exit 退出。")
         while True:
             question = input("你：").strip()
             if not question:
                 continue
             if question.lower() in {"exit", "quit"}:
                 break
-            if question == "/clear":
-                agent.clear_history()
-                print("历史已清空。")
+            if question in {"/sessions", "/clear"}:
+                session = select_session(manager) if question == "/sessions" else create_session(manager)
+                if session is None:
+                    break
+                agent = GuideAgent(client, ToolExecutor(), session)
                 continue
             if question == "/compact":
                 result = session.compact_now()

@@ -120,5 +120,5 @@ class GuideAgent:
             self.session.append_history([{"type": "turn/end", "turn": turn, "reason": reason.value}])
 
     def clear_history(self) -> None:
-        """清空本地文件和内存中的历史，下一次询问从新会话开始。"""
+        """清空独立会话的历史；已登记的会话应创建新会话。"""
         self.session.clear()

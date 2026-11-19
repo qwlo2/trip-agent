@@ -1,5 +1,6 @@
 import time
-from contextlib import closing
+from contextlib import ExitStack, closing
+from sqlite3 import Connection
 
 from .sqlite import get_connection
 
@@ -23,10 +24,15 @@ class Stage1Store:
         session_id: str,
         seq: int,
         completed_at: int,
+        *,
+        connection: Connection | None = None,
     ) -> bool:
-        """仅记录比当前版本更新的完整 Turn。"""
-        with closing(get_connection()) as conn, conn:
-            cursor = conn.execute(
+        """仅记录更新的完整 Turn，可复用调用方已开启的事务。"""
+        with ExitStack() as stack:
+            if connection is None:
+                connection = stack.enter_context(closing(get_connection()))
+                stack.enter_context(connection)
+            cursor = connection.execute(
                 """
                 INSERT INTO stage1_outputs (
                     session_id, last_completed_seq, last_completed_at

@@ -1,10 +1,12 @@
 """组合历史存储和模型上下文，提供会话级操作。"""
 
+import time
 from typing import Any, Callable, Sequence
 
 from compact import Compact, CompactResult
 from context_builder import ContextBuilder, SurfaceNode
-from history import HistoryStore
+from database.stage1_store import Stage1Store
+from history import HistoryStore, TurnEndReason
 from tokens import Tokens
 
 
@@ -17,6 +19,8 @@ class Session:
         context: ContextBuilder,
         system_prompt: str,
         compact: Compact,
+        *,
+        session_id: str | None = None,
     ) -> None:
         """加载历史消息到上下文，并恢复最近的 turn 编号。
 
@@ -25,7 +29,9 @@ class Session:
             context: 用于存储消息的空上下文对象。
             system_prompt: 新建或清空会话时使用的系统身份提示词。
             compact: 当前会话拥有的压缩对象，调用时由 Session 提供上下文和历史。
+            session_id: SessionManager 分配的持久化标识；独立使用时可不传入。
         """
+        self.session_id = session_id
         self.history = history
         self.context = context
         self.system_prompt = system_prompt
@@ -37,21 +43,31 @@ class Session:
         self._replay(events)
 
     def _replay(self, events: list[dict[str, Any]]) -> None:
-        """按日志顺序重放 Append 和 Replace，构建当前有效消息，不按 Surface seq 排序。"""
+        """按日志顺序重建上下文，并恢复最后一次正常结束的事件序号。"""
         self.turn = max(event["turn"] for event in events)
+        self.last_completed_seq: int | None = None
         for event in events:
             if event["type"] == "message":
                 self.append_context(event["message"], usage=event.get("usage"), seq=event["seq"])
             elif event["type"] == "compaction/summary":
                 self.apply_summary(event)
+            elif event["type"] == "turn/end" and event.get("reason") == TurnEndReason.COMPLETED.value:
+                self.last_completed_seq = event["seq"]
 
     def append_history(self, events: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        """调用 HistoryStore.append() 写入事件并更新最近 turn，返回已编号的事件。"""
+        """先持久化事件，再将最新一次正常结束的序号同步到会话的记忆记录。"""
         if not self._projection_valid:
             raise RuntimeError("摘要已提交但消息投影未完成，请重启从日志重建")
         records = self.history.append(events)
+        completed_seq = None
         for event in records:
             self.turn = max(self.turn, event["turn"])
+            if event["type"] == "turn/end" and event.get("reason") == TurnEndReason.COMPLETED.value:
+                completed_seq = event["seq"]
+        if completed_seq is not None:
+            self.last_completed_seq = completed_seq
+            if self.session_id is not None:
+                Stage1Store().record_turn_end(self.session_id, completed_seq, int(time.time()))
         return records
 
     def append_context(
@@ -122,7 +138,9 @@ class Session:
         return event
 
     def clear(self) -> None:
-        """清空历史、上下文、token 及压缩缓存，重新写入系统消息并重置 turn。"""
+        """清空独立会话；已登记的会话应通过 SessionManager 创建新会话。"""
+        if self.session_id is not None:
+            raise ValueError("已登记的会话不能重置序号，请创建新会话")
         self.history.clear()
         self.context.clear()
         self.tokens.reset()

@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from data_paths import PROJECT_ROOT, get_data_paths
 from memory.settings_loader import load_config
 
 
@@ -32,9 +33,22 @@ class EventReader:
 
     def __init__(self, path: str | Path, config: dict[str, Any] | None = None) -> None:
         """接收日志路径及已加载的配置；默认通过统一加载器读取 memory/.config。"""
-        self.path = Path(path)
+        self.path = PROJECT_ROOT / path
         self.config = config if config is not None else load_config()
         self.source_max_seq = -1
+
+    @classmethod
+    def for_session(
+        cls,
+        session_id: str,
+        *,
+        log_path: str | Path | None = None,
+        config: dict[str, Any] | None = None,
+    ) -> "EventReader":
+        """读取指定会话，可传入数据库记录的路径以兼容旧日志。"""
+        paths = get_data_paths()
+        path = paths.event_log(session_id) if log_path is None else paths.resolve_event_log(session_id, log_path)
+        return cls(path, config)
 
     def read(self) -> list[MemoryCandidate]:
         """扫描文件末尾最多 max_read_bytes，返回按来源事件由新到旧的候选项。

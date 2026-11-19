@@ -23,6 +23,28 @@ Chat Completions	通常由调用方传入完整消息历史
 Responses API	支持通过 previous_response_id 延续响应上下文
 Conversations API	支持服务端管理持久化对话状态
 
+实现会话管理，在sqlite中建立sessions表，字段如下：
+session-id，event-log-path，name，
+is-archives，usage，created_at
+
+然后通过session-manager管理sessions函数如下
+open：
+切换session，每一次切换都增加使用次数；
+
+get-sessions：
+呈现现有的session，但是会限制显示的数量，由使用次数来来筛选，
+同时会将这些session进行缓存，采用dic的形式，{session-id，event-long地址}；
+
+archived/delete：
+归档则在表中表明为1，不再显示，删除则直接删除event-log，session表和store1-outputs
+全局记忆不必删除，在下一次筛选时自动淘汰
+
+archived：
+更改is-archived
+
+create：
+创建session，并sessions，store1-outputs的表项
+
 1.2 history
   
 采用事件日志，将用户输入，llm输出，每个工具调用作为一次seq，
@@ -114,6 +136,7 @@ B：安全预留，同样设置为当前模型支持的最大输出 Token。
     局部记忆-sqlite(通过数据库管理元数据，记录使用次数等，也方便提权来压缩全局)
     （增加变量标记是否参与全局提取）
     全局记忆-md
+    store_database（提供数据库的初始化和连接，以及对外接口）
 
 phase1：
       会从event-log中筛选seq，从文件末尾反向扫描，筛选按事件类型先分优先级，
@@ -198,6 +221,9 @@ Agent 重新启动
            ▼
        更新 Global Memory
 
+1.5路由模块
+   通过在env中配置data目录，让其读取整个然后通过函数返回对应的其他data目录
+当在不同目录启动程序时，不会出现错误
 
 二、响应解析和报文
  llm返回后追加记录和工作记忆再解析，一次对话存储，user-question，llm-response，tool-message，answer

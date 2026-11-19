@@ -1,3 +1,19 @@
+CREATE TABLE IF NOT EXISTS sessions (
+    -- 会话标识及独立 Event Log 的绝对路径
+    session_id TEXT PRIMARY KEY,
+    event_log_path TEXT NOT NULL UNIQUE,
+    name TEXT NOT NULL,
+
+    -- 归档只影响列表展示，usage 统计成功打开的次数
+    is_archived INTEGER NOT NULL DEFAULT 0
+        CHECK (is_archived IN (0, 1)),
+    usage INTEGER NOT NULL DEFAULT 0 CHECK (usage >= 0),
+    created_at INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_sessions_usage
+ON sessions(is_archived, usage DESC, created_at DESC, session_id);
+
 CREATE TABLE IF NOT EXISTS stage1_outputs (
     -- Session 唯一标识
     session_id TEXT PRIMARY KEY,

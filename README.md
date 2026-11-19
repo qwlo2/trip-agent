@@ -47,15 +47,80 @@ VS Code 的默认 Python 解释器已配置为 `.venv/bin/python`。若仍提示
 .venv/bin/python main.py
 ```
 
-可以提问“杭州有哪些适合亲子游的景点？”，再追问“帮我查一下西湖附近的餐厅”。
-输入 `/compact` 立即请求压缩，`/clear` 清空历史，`exit` 或 `quit` 退出。
+启动时每页展示最多 25 个未归档会话，按打开次数降序排列。
+输入编号打开会话，输入 `0` 新建，使用 `n` 和 `p` 翻页。
+进入会话后，可以提问“杭州有哪些适合亲子游的景点？”，再追问“帮我查一下西湖附近的餐厅”。
+输入 `/sessions` 切换会话，`/clear` 创建并进入新会话（保留旧历史），
+`/compact` 请求压缩，`exit` 或 `quit` 退出。
 也可以要求导游压缩上下文，由模型调用 `compact_context` 工具。
 
 Agent 每轮自动询问模型、执行模型请求的所有工具、回传结果，直到生成回复。
 每个问题最多请求模型 6 次，可通过 `GuideAgent(..., max_steps=...)` 调整。
 工具和 API 错误直接抛出；达到次数上限仍未完成时也会抛出异常，进度保留。
 
-历史保存到项目目录下的 `data/history.jsonl`，每行一个事件：
+### 数据目录
+
+`DSH_DATA_DIR` 默认为 `./data`，可在 `.env` 中设置，也可用同名系统环境变量覆盖。
+相对路径以项目根目录为基准，绝对路径可直接使用。进程首次调用
+`data_paths.get_data_paths()` 时加载配置。
+
+| 相对于数据根目录的路径 | 用途 |
+| --- | --- |
+| `state.db` | SQLite 的 `sessions`、`stage1_outputs`、`memory_jobs` |
+| `sessions/<session_id>/events.jsonl` | 各会话的事件日志 |
+| `memories/rollout_summaries/` | Phase 1 局部记忆 |
+| `memories/memory_summary.md` | 全局记忆 |
+| `memories/phase2_workspace_diff.md` | Phase 2 工作区差异 |
+
+`DataPaths.ensure_directories()` 创建公共目录。数据库由 `init_database()` 初始化，
+会话目录由 `SessionManager.create()` 创建。Phase 1 可用
+`EventReader.for_session(session_id, log_path=...)` 读取会话日志；
+Phase 1 和 Phase 2 的记忆文件位置由 `DataPaths` 提供。
+
+### 会话管理
+
+`SessionManager` 的字段为 `session_id`、`event_log_path`、`name`、
+`is_archived`、`usage` 和 `created_at`。新记录的 `event_log_path` 相对于数据根目录，
+`created_at` 为 Unix 秒级时间戳。
+
+```python
+from agent import SYSTEM_PROMPT
+from client import Trip_Client
+from main import load_compact_settings
+from session_manager import SessionManager
+
+with Trip_Client() as client:
+    manager = SessionManager(client, SYSTEM_PROMPT, load_compact_settings())
+    session = manager.create("杭州旅游")
+    sessions = manager.get_sessions()
+    session = manager.open(session.session_id)
+```
+
+- `create(name)`：创建日志和 `sessions`、`stage1_outputs` 表项，返回新会话。
+- `open(session_id)`：重放日志并返回 `Session`；每次成功打开将使用次数加 1。
+- `get_sessions(limit=25, offset=0)`：按使用次数降序列出未归档会话，
+  同次数时新会话优先；`cache` 保存本页的 `{session_id: event_log_path}`。
+  默认数量参考 [Codex 会话选择器的 PAGE_SIZE](https://github.com/openai/codex/blob/main/codex-rs/tui/src/resume_picker.rs)。
+- `archived(session_id, is_archived=True)`：设置归档标记；传入 `False` 恢复展示。
+- `delete(session_id)`：删除日志、会话表项、局部记忆和对应 Phase 1 任务；
+  已有全局记忆在后续 Phase 2 筛选时淘汰。
+
+将返回的 `session` 传入 `GuideAgent(client, executor, session)` 即可问答。
+管理器只缓存列表中的路径，打开时重新加载对应日志和上下文；客户端由调用方关闭。
+命令行从 `sessions` 表列出已登记的会话。
+此前由独立问答入口生成、尚未登记的 `sessions/default/events.jsonl` 或 `history.jsonl`
+仍可通过 `HistoryStore()` 读取，启动时不会自动导入。
+
+旧版 `sessions/<session_id>.jsonl` 可原地打开，数据库中的旧绝对路径只要仍指向当前数据根目录
+内该会话的日志，也可继续读取。移动数据目录前，应先备份 SQLite，将旧绝对路径改为相对路径，
+然后复制整个数据根目录并更新 `DSH_DATA_DIR`。新会话的记录已经是相对路径。
+如果旧安装还留有 `memory.db`，应停用写入后，使用 SQLite 备份将旧库复制到新的
+`state.db` 位置。若两个库都已有记录，先核对并合并数据，保留两份原文件。
+路径初始化不会移动或覆盖数据。
+
+### 事件日志
+
+历史每行一个事件：
 
 - `seq`：整个文件内从 0 递增，消息和边界事件均占用一个编号，重启后接续。
 - `seq=0`：固定为 LLM 的系统身份提示词，使用 `turn=0`；此提示也用于后续请求。
@@ -76,11 +141,14 @@ Agent 每轮自动询问模型、执行模型请求的所有工具、回传结�
 ```
 
 `turn/end.reason` 为 `TurnEndReason`：`completed`、`error` 或 `max_steps`。
+对于已登记的会话，`completed` 的 `turn/end` 成功写入日志后，才用其 `seq` 更新
+`stage1_outputs.last_completed_seq`。其他结束原因保留在日志中。
+重新打开会话会从日志补录遗漏的正常结束记录，补录时间以日志文件的修改时间估算。
 发生异常时记录当前 `step/end` 和 `turn/end`，异常继续向调用方传播。
 所有事件立即追加并执行 flush、fsync，不等待整轮问答完成。
 重启时依次重放消息 Append 和摘要 Replace，仅将当前有效消息提供给 LLM。
 `HistoryStore.load(system_prompt)` 初始化日志和编号，`append()` 追加事件，
-`clear()` 清空日志；Session 清空后会重新写入 seq=0 的系统消息并重置 turn。
+`clear()` 清空日志。独立 Session 清空后会重新写入 seq=0 的系统消息并重置 turn。
 
 `Session(history, context, system_prompt, compact)` 持有
 `HistoryStore`、`ContextBuilder`、`Tokens` 和 `Compact`，加载消息上下文并恢复 token 缓存，
@@ -94,7 +162,7 @@ Agent 每轮自动询问模型、执行模型请求的所有工具、回传结�
 - `measure_context_tokens(messages=None)`：统计实际上下文并更新 token 缓存。
 - `compact_if_needed()`：向所属 Compact 传入当前会话，自动检查并压缩。
 - `compact_now(source="manual")`：工具和命令行入口，转发给所属 Compact。
-- `clear()`：清空历史、上下文、token 及压缩缓存，再重新初始化系统消息。
+- `clear()`：重置独立会话的状态；已登记的会话通过创建新会话开始新的日志。
 
 `ContextBuilder` 使用 `SurfaceNode(seq, message)` 维护当前有效消息，支持
 `append(message, seq)`、`build()`、`nodes()`、`locate_range()`、`replace()` 和 `clear()`。
@@ -175,13 +243,13 @@ Compact 直接使用摘要正文，记录替换前后的 Token 成本，不额�
 
 摘要生成失败或生成期间退出不会改变原消息；完整提交后、内存 Replace 前退出，
 重启会完成相同投影。记录以换行作为提交边界，末尾未完整写入的一行会先备份为
-`history.jsonl.incomplete.<时间戳>.bak` 再移除，不视为有效事件。
+`<日志文件名>.incomplete.<时间戳>.bak` 再移除，不视为有效事件。
 完整行损坏、seq 乱序或 Replace 来源异常会报错，不静默忽略。
 提交持久化失败，或日志已提交但内存投影失败时，当前实例停止后续写入，
 要求重启按实际日志重建，避免使用过期 seq 或旧投影继续记录。
 
 当前不提供中断任务的续跑功能。如果中断留下不完整的工具调用消息，
-可先用 `/clear` 清空历史再开始新问答。上述恢复针对历史投影及压缩提交，不续跑业务工具。
+可用 `/clear` 创建会话并开始新问答。上述恢复针对历史投影及压缩提交，不续跑业务工具。
 历史存储只支持当前事件格式，不提供旧消息记录的导入或转换。
 当前为单会话，模型只接收压缩后的有效上下文，History 保留全部原始记录。
 

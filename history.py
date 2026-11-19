@@ -9,6 +9,8 @@ from enum import Enum
 from pathlib import Path
 from typing import Any
 
+from data_paths import PROJECT_ROOT, get_data_paths
+
 
 class TurnEndReason(str, Enum):
     """问答结束原因：正常完成、执行异常或达到步骤上限。"""
@@ -22,9 +24,8 @@ class HistoryStore:
     """追加带全局 seq 的历史事件，seq=0 固定为系统身份提示词。"""
 
     def __init__(self, path: str | Path | None = None) -> None:
-        """指定事件 JSONL 文件，默认使用 data/history.jsonl。"""
-        history_dir = Path(__file__).parent / "data"
-        self.path = Path(path) if path is not None else history_dir / "history.jsonl"
+        """接收日志路径，省略时使用数据目录内的默认会话。"""
+        self.path = PROJECT_ROOT / path if path is not None else get_data_paths().default_event_log()
         self._next_seq = 0
         self._events: dict[int, dict[str, Any]] = {}
         self._write_failed = False
