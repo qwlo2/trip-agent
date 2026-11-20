@@ -8,6 +8,14 @@ from settings_loader import load_settings
 
 # Python 仅保留内部字段与环境变量名称的映射，默认参数由 .config.example 提供。
 _ENV_KEYS = {
+    "max_sessions": "MEMORY_PHASE1_MAX_SESSIONS",
+    "scan_limit": "MEMORY_PHASE1_SCAN_LIMIT",
+    "max_age_days": "MEMORY_PHASE1_MAX_AGE_DAYS",
+    "min_idle_seconds": "MEMORY_PHASE1_MIN_IDLE_SECONDS",
+    "lease_seconds": "MEMORY_PHASE1_LEASE_SECONDS",
+    "max_attempts": "MEMORY_PHASE1_MAX_ATTEMPTS",
+    "retry_delay_seconds": "MEMORY_PHASE1_RETRY_DELAY_SECONDS",
+    "max_output_tokens": "MEMORY_PHASE1_MAX_OUTPUT_TOKENS",
     "max_read_bytes": "MEMORY_PHASE1_MAX_READ_BYTES",
     "max_record_bytes": "MEMORY_PHASE1_MAX_RECORD_BYTES",
     "max_rollout_bytes": "MEMORY_PHASE1_MAX_ROLLOUT_BYTES",
@@ -24,7 +32,7 @@ def load_config() -> dict[str, Any]:
     """按系统环境变量、memory/.config、.config.example 的顺序获取参数。
 
     使用模块所在目录定位文件，不依赖工作目录，也不修改进程环境变量。
-    未设置或留空时使用模板默认值；字节数、Token 数及优先级校验为正整数，
+    未设置或留空时使用模板默认值；整数参数必须为正，只有最短静置时间允许为 0。
     input_budget_ratio 校验在 (0, 1] 内，W 从根目录 .env 的模型配置读取。
     """
     directory = Path(__file__).resolve().parent
@@ -36,9 +44,14 @@ def load_config() -> dict[str, Any]:
     config = {}
     for key, name in _ENV_KEYS.items():
         value = values[name]
-        if value <= 0:
+        if key == "min_idle_seconds":
+            if value < 0:
+                raise ValueError(f"{name} 不得小于 0")
+        elif value <= 0:
             raise ValueError(f"{name} 必须为正整数")
         config[key] = value
+    if config["min_idle_seconds"] > config["max_age_days"] * 86400:
+        raise ValueError("Phase 1 最短静置时间不能超过会话历史上限")
     ratio = values["input_budget_ratio"]
     if not 0 < ratio <= 1:
         raise ValueError("input_budget_ratio 必须大于 0 且不超过 1")

@@ -50,12 +50,12 @@ class EventReader:
         path = paths.event_log(session_id) if log_path is None else paths.resolve_event_log(session_id, log_path)
         return cls(path, config)
 
-    def read(self) -> list[MemoryCandidate]:
+    def read(self, *, max_seq: int | None = None) -> list[MemoryCandidate]:
         """扫描文件末尾最多 max_read_bytes，返回按来源事件由新到旧的候选项。
 
         固定打开时的文件大小，忽略未以换行提交的末行和扫描边界上的残行。
         超过 max_record_bytes 的原始行直接跳过，不解析或截断原始事件。
-        source_max_seq 记录本次扫描中可解析事件的最大 seq，包括无关事件。
+        max_seq 限制纳入的来源版本；source_max_seq 包含该范围内的无关事件。
         文件及完整 JSON 行的读取、解析错误直接向调用方传播。
         """
         self.source_max_seq = -1
@@ -80,9 +80,10 @@ class EventReader:
             record_bytes = end - begin + 1
             if record_bytes <= self.config["max_record_bytes"]:
                 event = json.loads(data[begin:end])
-                self.source_max_seq = max(self.source_max_seq, event["seq"])
-                if event["type"] == "message":
-                    candidates.extend(self._candidates(event))
+                if max_seq is None or event["seq"] <= max_seq:
+                    self.source_max_seq = max(self.source_max_seq, event["seq"])
+                    if event["type"] == "message":
+                        candidates.extend(self._candidates(event))
             end = previous
         return candidates
 

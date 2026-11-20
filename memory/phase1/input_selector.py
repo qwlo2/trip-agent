@@ -35,6 +35,7 @@ class InputSelector:
         *,
         session_id: str,
         source_max_seq: int,
+        token_budget: int | None = None,
     ) -> MemorySelection:
         """按优先级升序、seq 降序尝试纳入，最后按 seq 升序输出。
 
@@ -43,9 +44,11 @@ class InputSelector:
         分别保留为独立记录，共享 seq，同 seq 按原始候选项顺序排列。
         输入预算按格式化后消息列表的 JSON 字节数计量，包含 seq、自定义 role
         等字段；默认每四个 UTF-8 字节估算一个 Token，向上取整。
-        Token 预算 B=floor(context_window × input_budget_ratio)。
+        Token 预算 B=floor(context_window × input_budget_ratio)，调用方可进一步缩小预算。
         """
         budget_tokens = floor(self.config["context_window"] * self.config["input_budget_ratio"])
+        if token_budget is not None:
+            budget_tokens = min(budget_tokens, token_budget)
         budget_bytes = self.config["max_rollout_bytes"]
         bytes_per_token = self.config["bytes_per_token"]
         used_bytes = len(b"[]")

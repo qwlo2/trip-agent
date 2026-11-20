@@ -39,6 +39,8 @@ class Session:
         self.tokens = Tokens(compression_limit=compact.threshold)
         self.tools_provider: Callable[[], Sequence[dict[str, Any]]] | None = None
         self._projection_valid = True
+        """表示 当前内存中的消息上下文可以继续使用,摘要替换失败，标记留在 False,
+        后续追加日志或上下文都会被拦住"""
         events = history.load(system_prompt)
         self._replay(events)
 
@@ -55,7 +57,7 @@ class Session:
                 self.last_completed_seq = event["seq"]
 
     def append_history(self, events: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        """先持久化事件，再将最新一次正常结束的序号同步到会话的记忆记录。"""
+        """先持久化事件，再同步会话活动时间及最新正常结束的序号。"""
         if not self._projection_valid:
             raise RuntimeError("摘要已提交但消息投影未完成，请重启从日志重建")
         records = self.history.append(events)
@@ -66,8 +68,8 @@ class Session:
                 completed_seq = event["seq"]
         if completed_seq is not None:
             self.last_completed_seq = completed_seq
-            if self.session_id is not None:
-                Stage1Store().record_turn_end(self.session_id, completed_seq, int(time.time()))
+        if self.session_id is not None and records:
+            Stage1Store().record_session_activity(self.session_id, int(time.time()), completed_seq)
         return records
 
     def append_context(

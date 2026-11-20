@@ -64,17 +64,22 @@ class SessionManager:
                 Compact(self.client, **self.compact_settings),
                 session_id=session_id,
             )
+            log_updated_at = int(path.stat().st_mtime)
             if session.last_completed_seq is not None:
                 # 日志不含结束时间，补录时用文件修改时间估算。
                 Stage1Store().record_turn_end(
                     session_id,
                     session.last_completed_seq,
-                    int(path.stat().st_mtime),
+                    log_updated_at,
                     connection=conn,
                 )
             conn.execute(
-                "UPDATE sessions SET usage = usage + 1 WHERE session_id = ?",
-                (session_id,),
+                """
+                UPDATE sessions
+                SET usage = usage + 1, updated_at = MAX(COALESCE(updated_at, created_at), ?)
+                WHERE session_id = ?
+                """,
+                (log_updated_at, session_id),
             )
         self.current_session = session
         return session

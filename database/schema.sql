@@ -4,11 +4,13 @@ CREATE TABLE IF NOT EXISTS sessions (
     event_log_path TEXT NOT NULL UNIQUE,
     name TEXT NOT NULL,
 
-    -- 归档只影响列表展示，usage 统计成功打开的次数
+    -- 已归档的会话不进入列表或 Phase 1；usage 统计成功打开的次数
     is_archived INTEGER NOT NULL DEFAULT 0
         CHECK (is_archived IN (0, 1)),
     usage INTEGER NOT NULL DEFAULT 0 CHECK (usage >= 0),
-    created_at INTEGER NOT NULL
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER,
+    memory_enabled INTEGER NOT NULL DEFAULT 1 CHECK (memory_enabled IN (0, 1))
 );
 
 CREATE INDEX IF NOT EXISTS idx_sessions_usage

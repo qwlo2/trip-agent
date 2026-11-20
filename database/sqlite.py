@@ -17,8 +17,18 @@ def get_connection() -> sqlite3.Connection:
 
 
 def init_database() -> None:
-    """创建数据库，并按 schema.sql 初始化表和索引，可重复调用。"""
+    """初始化数据库，并在已有会话表中补齐 Phase 1 的筛选字段。"""
     get_data_paths().ensure_directories()
     schema = SCHEMA_PATH.read_text(encoding="utf-8")
     with closing(get_connection()) as conn:
         conn.executescript(schema)
+        with conn:
+            conn.execute("BEGIN IMMEDIATE")
+            columns = {row["name"] for row in conn.execute("PRAGMA table_info(sessions)")}
+            if "updated_at" not in columns:
+                conn.execute("ALTER TABLE sessions ADD COLUMN updated_at INTEGER")
+            if "memory_enabled" not in columns:
+                conn.execute(
+                    "ALTER TABLE sessions ADD COLUMN memory_enabled INTEGER NOT NULL DEFAULT 1 "
+                    "CHECK (memory_enabled IN (0, 1))"
+                )

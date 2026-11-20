@@ -89,6 +89,7 @@ class Trip_Client:
         tool_choice: str | dict[str, Any] = "auto",
         temperature: float | None = None,
         max_tokens: int | None = None,
+        response_format: dict[str, Any] | None = None,
     ) -> ChatCompletion:
         """
         str | dict[str, Any]相当于union,
@@ -105,6 +106,7 @@ class Trip_Client:
             tool_choice: 工具选择策略，仅在传入非空工具列表时发送给 API。
             temperature: 可选采样温度，None 表示采用服务端默认值。
             max_tokens: 可选的最大输出 token 数，None 表示采用服务端默认值。
+            response_format: 可选输出格式，例如 {"type": "json_object"}。
 
         Returns:
             OpenAI SDK 返回的原始 ChatCompletion 响应，由调用方决定何时解析。
@@ -119,6 +121,8 @@ class Trip_Client:
             options["temperature"] = temperature
         if max_tokens is not None:
             options["max_tokens"] = max_tokens
+        if response_format is not None:
+            options["response_format"] = response_format
 
         response = self._api.chat.completions.create(
             model=self.model,

@@ -166,11 +166,13 @@ phase1：
       （或许可以通过记忆恢复来解决）
       每个turn之间相隔时差可能会很大，但是未完成的turn没有意义，因此代替phase1的活跃事件限制来筛选session
 
+      完善了session-maneger和追加last_completed_seq，接下来完善phase1.py
+
        memory_jobs表是phase1，2的任务控制，用来判断是否成功以及限制只有一个worker进行提取
  
-文件修改方式：
-  phase1：将sqlite中的旧文件覆盖，即update
-  phase2：采用这个框架，通过git得出增删改，然后将哪些文件增删改，以及原本的memory在memory-agent中通过llm
+  phase2：
+   提取256条局部，必须在30天内活跃，每次全局的提取间隔6小时，数据库只能重试3次
+  采用这个框架，通过git得出增删改，然后将哪些文件增删改，以及原本的memory在memory-agent中通过llm
   进行整合，由llm根据文件增删改的变化，判断是否要更改记忆，随后通过tool来进行改变
 
  ~/.codex/memories_v2/
