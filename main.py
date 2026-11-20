@@ -6,6 +6,7 @@ from typing import Any
 
 from agent import GuideAgent, SYSTEM_PROMPT
 from client import Trip_Client
+from memory.memory_maneger import MemoryManager
 from session import Session
 from session_manager import SESSION_PAGE_SIZE, SessionManager
 from settings_loader import convert_settings, load_settings
@@ -100,6 +101,10 @@ def main() -> None:
         session = select_session(manager)
         if session is None:
             return
+        try:
+            MemoryManager(client).run(current_session_id=session.session_id)
+        except Exception as exc:
+            print(f"启动时的记忆提取失败（{type(exc).__name__}），继续导游问答。")
         agent = GuideAgent(client, ToolExecutor(), session)
         print("导游已就绪。/sessions 切换会话，/clear 新建会话，/compact 压缩上下文，exit 退出。")
         while True:

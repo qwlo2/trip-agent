@@ -25,6 +25,13 @@ _ENV_KEYS = {
     "priority_user": "MEMORY_PRIORITY_USER",
     "priority_assistant": "MEMORY_PRIORITY_ASSISTANT",
     "priority_tool": "MEMORY_PRIORITY_TOOL",
+    "phase2_max_items": "MEMORY_PHASE2_MAX_ITEMS",
+    "phase2_active_days": "MEMORY_PHASE2_ACTIVE_DAYS",
+    "phase2_interval_seconds": "MEMORY_PHASE2_INTERVAL_SECONDS",
+    "phase2_max_retries": "MEMORY_PHASE2_MAX_RETRIES",
+    "phase2_max_output_tokens": "MEMORY_PHASE2_MAX_OUTPUT_TOKENS",
+    "phase2_max_steps": "MEMORY_PHASE2_MAX_STEPS",
+    "phase2_tool_page_chars": "MEMORY_PHASE2_TOOL_PAGE_CHARS",
 }
 
 

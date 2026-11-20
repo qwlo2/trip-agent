@@ -65,43 +65,50 @@ def _extract(
     return summary, slug if summary and redact(slug) == slug else ""
 
 
-def run_phase1(client: Trip_Client, *, current_session_id: str | None = None) -> dict[str, str]:
-    """处理一批会话并返回状态；调用方先初始化数据库，传入当前会话 ID 可排除它。"""
-    config = load_config()
-    bytes_per_token = config["bytes_per_token"]
-    # 预留系统提示、消息封装和输出容量，同样按近似 Token 估算输入。
-    prompt_bytes = len(json.dumps([
-        {"role": "system", "content": _SYSTEM_PROMPT}, {"role": "user", "content": ""},
-    ], ensure_ascii=False).encode("utf-8"))
-    prompt_tokens = (prompt_bytes + bytes_per_token - 1) // bytes_per_token
-    token_budget = config["context_window"] - prompt_tokens - config["max_output_tokens"]
-    if token_budget < 1:
-        raise ValueError("Phase 1 上下文窗口不足以容纳提示词、事件和输出预算")
+class Phase1Agent:
+    """领取会话并提取局部记忆。"""
 
-    store = Stage1Store()
-    selector = InputSelector(config)
-    outcomes = {}
-    for _ in range(config["max_sessions"]):
-        claim = store.claim_stage1(
-            scan_limit=config["scan_limit"], max_running=config["max_sessions"],
-            max_age_days=config["max_age_days"], min_idle_seconds=config["min_idle_seconds"],
-            lease_seconds=config["lease_seconds"], max_attempts=config["max_attempts"],
-            excluded_sessions=tuple(outcomes), current_session_id=current_session_id,
-        )
-        if claim is None:
-            break
-        try:
-            summary, slug = _extract(client, selector, claim, config, token_budget)
-        except Exception as exc:
-            # 不落盘 SDK 错误正文，避免保存请求和响应中的敏感内容。
-            failed = store.fail_stage1(
-                claim, type(exc).__name__, retry_delay_seconds=config["retry_delay_seconds"],
+    def __init__(self, client: Trip_Client) -> None:
+        """复用调用方管理的模型客户端。"""
+        self._client = client
+
+    def run(self, *, current_session_id: str | None = None) -> dict[str, str]:
+        """处理一批会话并返回状态；调用方先初始化数据库，传入当前会话 ID 可排除它。"""
+        config = load_config()
+        bytes_per_token = config["bytes_per_token"]
+        # 预留系统提示、消息封装和输出容量，同样按近似 Token 估算输入。
+        prompt_bytes = len(json.dumps([
+            {"role": "system", "content": _SYSTEM_PROMPT}, {"role": "user", "content": ""},
+        ], ensure_ascii=False).encode("utf-8"))
+        prompt_tokens = (prompt_bytes + bytes_per_token - 1) // bytes_per_token
+        token_budget = config["context_window"] - prompt_tokens - config["max_output_tokens"]
+        if token_budget < 1:
+            raise ValueError("Phase 1 上下文窗口不足以容纳提示词、事件和输出预算")
+
+        store = Stage1Store()
+        selector = InputSelector(config)
+        outcomes = {}
+        for _ in range(config["max_sessions"]):
+            claim = store.claim_stage1(
+                scan_limit=config["scan_limit"], max_running=config["max_sessions"],
+                max_age_days=config["max_age_days"], min_idle_seconds=config["min_idle_seconds"],
+                lease_seconds=config["lease_seconds"], max_attempts=config["max_attempts"],
+                excluded_sessions=tuple(outcomes), current_session_id=current_session_id,
             )
-            outcomes[claim.session_id] = "failed" if failed else "lost_claim"
-            continue
+            if claim is None:
+                break
+            try:
+                summary, slug = _extract(self._client, selector, claim, config, token_budget)
+            except Exception as exc:
+                # 不落盘 SDK 错误正文，避免保存请求和响应中的敏感内容。
+                failed = store.fail_stage1(
+                    claim, type(exc).__name__, retry_delay_seconds=config["retry_delay_seconds"],
+                )
+                outcomes[claim.session_id] = "failed" if failed else "lost_claim"
+                continue
 
-        committed = store.commit_stage1_result(
-            claim.session_id, claim.source_seq, summary, slug, claim.ownership_token,
-        )
-        outcomes[claim.session_id] = "committed" if committed else "lost_claim"
-    return outcomes
+            committed = store.commit_stage1_result(
+                claim.session_id, claim.source_seq, summary, slug, claim.ownership_token,
+            )
+            outcomes[claim.session_id] = "committed" if committed else "lost_claim"
+        return outcomes

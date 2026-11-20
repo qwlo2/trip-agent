@@ -4,7 +4,7 @@ Python 3.10+。中文导游问答 Agent，支持高德工具、多轮对话和�
 
 ## 配置
 
-在项目 `.env` 中填写 `DEEPSEEK_API_KEY` 和高德地图的 `AMAP_API_KEY`。
+在项目 `.env` 中填写 `DEEPSEEK_API_KEY`。需要高德地图工具时，再填写 `AMAP_API_KEY`。
 高德 Key 需选择 Web 服务类型，并具有对应搜索及路线服务的权限。
 `.env.example` 为可提交的配置模板。系统环境变量优先于 `.env`；
 `DEEPSEEK_TIMEOUT` 和 `AMAP_TIMEOUT` 单位均为秒。
@@ -319,23 +319,17 @@ with Trip_Client() as client:
 - `call_tool(name, arguments)`：按名称执行工具并返回结果，未知名称抛出 `KeyError`，
   工具异常直接向调用方传播。JSON Schema 用于模型侧描述，不进行本地 Schema 校验。
 
-内置高德工具如下，均返回高德原始 JSON：
+配置 `AMAP_API_KEY` 后，执行器首次获取工具列表时通过 Streamable HTTP 连接
+[高德官方 MCP](https://lbs.amap.com/api/mcp-server/gettingstarted)。
+只注册服务端返回的地点搜索、周边搜索、地点详情以及步行、驾车、公交路线工具，
+参数定义以 MCP 返回的 Schema 为准。坐标应从高德搜索结果取得。
+MCP 查询失败时，工具返回错误结果给模型；工具发现失败时，当前执行器仍可使用本地工具，
+重新启动或切换会话后可重新发现。
 
-| 工具名 | 作用 | 主要参数 |
-| --- | --- | --- |
-| `amap_search_places` | 按城市搜索景点、餐厅、酒店等，获取地址和坐标 | `keywords`、`city` |
-| `amap_search_nearby` | 搜索地点附近的配套设施，按距离排序 | `location`、`keywords`、`radius` |
-| `amap_plan_route` | 查询步行、驾车、公交路线及预计距离、耗时 | `origin`、`destination`、`mode` |
-
-搜索支持 `page`、`page_size` 分页。坐标均为高德 GCJ-02 坐标，格式为
-`经度,纬度`，应从高德搜索结果取得。公交模式 `mode="transit"` 需要 `city`，
-跨城公交还需 `destination_city`。工具不提供景点实时库存或预订能力。
-
-高德接口参考 [POI 搜索文档](https://lbs.amap.com/api/webservice/guide/api-advanced/search)
-及[路线查询文档](https://lbs.amap.com/api/webservice/guide/api/direction)。
+从旧版本升级时，先运行 `.venv/bin/python -m pip install -r requirements.txt`。
 
 新增其他工具时，只需使用 `executor.register_tool()` 注册，无需修改 Client。
-未填写高德 Key 时仍可注册和使用其他工具，实际调用高德工具时才检查 Key。
+未填写高德 Key 时，不会向模型提供高德工具；普通问答和其他工具仍可使用。
 
 ## LLM 响应
 
