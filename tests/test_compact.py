@@ -30,9 +30,15 @@ def response(content="摘要", *, calls=None, finish="stop"):
     })
 
 
-def tool_call(call_id, name="echo"):
+def tool_call(call_id, name="echo", **arguments):
     """创建模型可见的函数调用。"""
-    return {"id": call_id, "type": "function", "function": {"name": name, "arguments": "{}"}}
+    return {"id": call_id, "type": "function", "function": {"name": name, "arguments": json.dumps(arguments)}}
+
+
+def completion(answer, *session_ids):
+    """创建一次符合 GuideAgent 终止协议的离线响应。"""
+    call = tool_call("finish", "finish_answer", answer=answer, used_session_ids=list(session_ids))
+    return response(None, calls=[call], finish="tool_calls")
 
 
 class FakeClient:
@@ -318,11 +324,11 @@ class CompactTests(unittest.TestCase):
             threshold_ratio=0.9, retain_ratio=0.01,
         )
         self.session = Session(HistoryStore(self.path), ContextBuilder(), "unused", compact)
-        executor = ToolExecutor()
+        executor = ToolExecutor(include_amap=False)
         executor.register_tool("echo", "测试", {"type": "object", "properties": {}}, lambda: "z" * 600)
         self.client.normal_responses = [
             response(None, calls=[tool_call("compact", "compact_context"), tool_call("echo")], finish="tool_calls"),
-            response("完成"),
+            completion("完成"),
         ]
         observed_pending = []
         self.client.on_summary = lambda: observed_pending.append(compact.ensure_balance_cache(self.session).in_progress_tool_calls)
@@ -342,8 +348,8 @@ class CompactTests(unittest.TestCase):
     def test_agent_auto_compacts_before_request(self):
         """Agent 在普通请求之前自动摘要，并发送已替换的消息。"""
         self.populate()
-        self.client.normal_responses = [response("回答")]
-        agent = GuideAgent(self.client, ToolExecutor(), self.session)
+        self.client.normal_responses = [completion("回答")]
+        agent = GuideAgent(self.client, ToolExecutor(include_amap=False), self.session)
         self.assertEqual(agent.ask("继续"), "回答")
         self.assertIsNone(self.client.requests[0][1])
         self.assertIsNotNone(self.client.requests[1][1])

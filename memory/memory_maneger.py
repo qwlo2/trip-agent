@@ -14,6 +14,6 @@ class MemoryManager:
         self._phase2 = Phase2Agent(client)
 
     def run(self, *, current_session_id: str | None = None) -> str:
-        """Phase 1 未领取任何会话时跳过 Phase 2；否则返回 Phase 2 的状态。"""
-        outcomes = self._phase1.run(current_session_id=current_session_id)
-        return self._phase2.run() if outcomes else "skipped"
+        """先处理局部记忆，再由 Phase 2 独立判断是否领取全局任务。"""
+        self._phase1.run(current_session_id=current_session_id)
+        return self._phase2.run()

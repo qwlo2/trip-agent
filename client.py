@@ -150,13 +150,7 @@ class Trip_Client:
         """
         choice = response.choices[0]
         message = choice.message.model_dump(exclude_none=True)
-        tool_calls = []
-        for call in message.get("tool_calls", []):
-            function = call["function"]
-            arguments = json.loads(function["arguments"])
-            if not isinstance(arguments, dict):
-                raise ValueError(f"工具 {function['name']} 的参数必须为 JSON 对象")
-            tool_calls.append(ToolCall(call["id"], function["name"], arguments))
+        tool_calls = [Trip_Client.parse_tool_call(call) for call in message.get("tool_calls", [])]
 
         return Message(
             role=choice.message.role,
@@ -168,6 +162,15 @@ class Trip_Client:
                 "usage": response.usage.model_dump() if response.usage is not None else None,
             },
         )
+
+    @staticmethod
+    def parse_tool_call(call: dict[str, Any]) -> ToolCall:
+        """解析单个调用，允许 Agent 为同批每个调用分别记录结果。"""
+        function = call["function"]
+        arguments = json.loads(function["arguments"])
+        if not isinstance(arguments, dict):
+            raise ValueError(f"工具 {function['name']} 的参数必须为 JSON 对象")
+        return ToolCall(call["id"], function["name"], arguments)
 
     def close(self) -> None:
         """关闭底层 SDK 客户端，释放 HTTP 连接资源。"""
