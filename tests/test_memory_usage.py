@@ -14,6 +14,8 @@ from data_paths import get_data_paths
 from database.phase2_store import Phase2Store
 from database.sqlite import get_connection
 from database.stage1_store import Stage1Store
+from memory.reader import search_memory, truncate_middle_with_token_budget, turn_memory_prompt
+from memory.search import MAX_CONTENT, MAX_MATCHES, MAX_OUTPUT_BYTES
 from memory.memory_maneger import MemoryManager
 from session_manager import SessionManager
 from test_compact import FakeClient, completion, response, tool_call
@@ -65,12 +67,12 @@ class MemoryUsageTests(unittest.TestCase):
         self.seed(allow=0)
         self.seed("B", "苏州园林", "suzhou")
         self.seed("C", "只有全局记忆用到此来源", "global")
-        self.path.write_text("快照甲 session-C.md")
+        self.path.write_text("快照甲" + "中" * 5000 + "session-C.md")
         self.executor.register_tool("refresh", "模拟 Phase 2 更新", {"type": "object"},
                                     lambda: self.path.write_text("快照乙"))
         self.client.normal_responses = [
-            step(tool_call("search", "search_memory", query="杭州"), tool_call("update", "refresh")),
-            step(tool_call("read", "read_memory", session_id="A"), tool_call("search2", "search_memory", query="SUZHOU")),
+            step(tool_call("search", "search_memory", queries=["杭州", "公交"]), tool_call("update", "refresh")),
+            step(tool_call("read", "read_memory", session_id="A"), tool_call("search2", "search_memory", queries=["SUZHOU"])),
             step(tool_call("read2", "read_memory", session_id="B")),
             completion("乘公交去园林", "A", "A", "B", "C"),
             completion("继续坐公交", "A"),
@@ -86,13 +88,19 @@ class MemoryUsageTests(unittest.TestCase):
             self.assertEqual(options["response_format"], {"type": "json_object"})
             self.assertNotIn("finish_answer", [tool["function"]["name"] for tool in tools])
             self.assertEqual([m["role"] for m in messages].count("system"), 1)
+            schema = next(tool["function"]["parameters"] for tool in tools if tool["function"]["name"] == "search_memory")
+            self.assertEqual(schema["required"], ["queries"])
+            self.assertEqual(schema["properties"]["queries"]["type"], "array")
+            self.assertEqual(messages[0], self.client.requests[0][0][0])
+            self.assertIn("tokens truncated…", messages[0]["content"])
             self.assertIn("快照甲", messages[0]["content"])
             self.assertNotIn("快照乙", messages[0]["content"])
         messages = self.client.requests[-1][0]
         results = {m["tool_call_id"]: json.loads(m["content"]) for m in messages if m["role"] == "tool"}
-        self.assertEqual(results["search"]["results"], [
-            {"session_id": "A", "source_seq": 10, "slug": "hangzhou", "preview": "杭州游览，偏好公交"},
-        ])
+        item, = results["search"]["results"]
+        self.assertEqual((item["session_id"], item["source_seq"], item["slug"]), ("A", 10, "hangzhou"))
+        self.assertEqual(item["matched_queries"], ["杭州", "公交"])
+        self.assertEqual(item["matches"][0]["content"], "杭州游览，偏好公交")
         self.assertEqual(results["read"]["summary"], "杭州游览，偏好公交")
         self.assertEqual(results["search2"]["results"][0]["session_id"], "B")
         self.assertEqual(results["read2"]["source_seq"], 10)
@@ -127,6 +135,8 @@ class MemoryUsageTests(unittest.TestCase):
     def test_legacy_session_replays_and_continues_without_terminal_tool(self):
         legacy = [
             {"role": "user", "content": "旧问题"},
+            {"role": "assistant", "tool_calls": [tool_call("lookup", "search_memory", query="杭州")]},
+            {"role": "tool", "tool_call_id": "lookup", "content": '{"results":[]}'},
             {"role": "assistant", "reasoning_content": "已完成", "tool_calls": [
                 tool_call("old", "finish_answer", answer="旧答案", used_session_ids=["A"]),
             ]},
@@ -232,11 +242,13 @@ class MemoryUsageTests(unittest.TestCase):
         self.seed("blank", summary=" \n")
         for i in range(12):
             self.seed(str(i), summary="杭州" * 4500)
-        search = self.executor.call_tool("search_memory", {"query": "hangzhou", "limit": 100})
+        search = self.executor.call_tool("search_memory", {"queries": ["杭州"], "limit": 100})
+        self.assertTrue(search["truncated"])
         self.assertEqual(len(search["results"]), 10)
         for item in search["results"]:
             self.assertTrue(item["session_id"].isdigit())
-            self.assertEqual(len(item["preview"]), 240)
+            self.assertEqual(len(item["matches"][0]["content"]), MAX_CONTENT)
+            self.assertTrue(item["truncated"])
         read = self.executor.call_tool("read_memory", {"session_id": "0"})
         self.assertTrue(read["truncated"])
         self.assertEqual(len(read["summary"]), 8000)
@@ -244,10 +256,11 @@ class MemoryUsageTests(unittest.TestCase):
             self.assertIn("error", self.executor.call_tool("read_memory", {"session_id": sid}))
 
     def test_full_request_budget_includes_snapshot_and_output(self):
-        self.path.write_text("快照" * 200)
+        self.path.write_text("快照" * 3000)
         self.client.normal_responses = [completion("完成")]
         self.agent.ask("预算")
         messages, tools, options = self.client.requests[0]
+        self.assertIn("tokens truncated…", messages[0]["content"])
         total = self.session.tokens.count_request(messages, tools, response_format=options["response_format"]) + options["max_tokens"]
         second = self.manager.create("切换会话")
         second.compact.context_window = total - 1
@@ -256,6 +269,98 @@ class MemoryUsageTests(unittest.TestCase):
             agent.ask("预算")
         self.assertEqual(len(self.client.requests), 1)
         self.assertEqual(second.history.load("导游")[-1]["reason"], "error")
+
+    def test_summary_byte_boundaries(self):
+        instructions = turn_memory_prompt()
+        for text in ('  引号"\n', '😀' * 2500, 'a' * 10000):
+            self.path.write_text(text)
+            self.assertEqual(json.loads(turn_memory_prompt().split("全局记忆（参考资料）\n")[1]), text)
+        head = "a" * 4999
+        tail = "b" * 4998
+        original = head + "中" + "删除" + "😀" + tail
+        self.path.write_text(original)
+        prompt = turn_memory_prompt()
+        summary = json.loads(prompt.split("全局记忆（参考资料）\n")[1])
+        self.assertEqual(summary, head + "…3 tokens truncated…" + tail)
+        self.assertLessEqual(len((head + tail).encode()), 10000)
+        self.assertEqual(self.path.read_text(), original)
+        self.assertTrue(prompt.startswith(instructions))
+        self.assertEqual(truncate_middle_with_token_budget("中文", 0), "…2 tokens truncated…")
+
+    def test_window_modes_and_original_context(self):
+        self.seed("A", "前言\n杭州\n杭州\n中间\n住宿\n尾行", "预算")
+        self.seed("B", "杭州和住宿", "other")
+        self.seed("C", "住宿", "杭州")
+        keys = ["杭州", "住宿"]
+        self.assertEqual([r["session_id"] for r in search_memory(keys, "all_on_same_line")["results"]], ["B"])
+        self.assertEqual([r["session_id"] for r in search_memory(keys, "all_within_lines", 2)["results"]], ["B"])
+        results = search_memory(keys, "all_within_lines", 3)["results"]
+        self.assertEqual({r["session_id"] for r in results}, {"A", "B"})
+        match, = next(r["matches"] for r in results if r["session_id"] == "A")
+        self.assertEqual((match["match_start_line"], match["match_end_line"], match["content_start_line"]), (3, 5, 2))
+        self.assertEqual(match["content"], "杭州\n杭州\n中间\n住宿\n尾行")
+        self.assertFalse(search_memory(["预算", "住宿"], "all_within_lines")["results"])
+
+    def test_normalization_and_match_ranking(self):
+        self.seed("A", "公交", "Hangzhou-Trip")
+        self.seed("B", "公交", "other")
+        self.seed("C", "公交", "other")
+        with closing(get_connection()) as conn, conn:
+            conn.execute("UPDATE stage1_outputs SET generated_at = CASE session_id WHEN 'A' THEN 1 ELSE 2 END")
+        results = search_memory([" hangzhou trip ", "HANGZHOU-TRIP", "公交"], normalized=True)["results"]
+        self.assertEqual([r["session_id"] for r in results], ["A", "B", "C"])
+        self.assertEqual(results[0]["matched_queries"], ["hangzhou trip", "公交"])
+        self.assertEqual(results[0]["matches"][-1], {"source": "slug", "content": "Hangzhou-Trip",
+                                                      "matched_queries": ["hangzhou trip"]})
+        with closing(get_connection()) as conn, conn:
+            conn.execute("UPDATE stage1_outputs SET generated_at = 3 WHERE session_id='C'")
+        self.assertEqual([r["session_id"] for r in search_memory(["公交"])["results"]], ["C", "B", "A"])
+        self.assertFalse(search_memory(["hangzhou-trip"], case_sensitive=True)["results"])
+        self.assertFalse(search_memory(["hangzhou trip"])["results"])
+
+    def test_search_validates_inputs_and_unreadable_rows(self):
+        for args in ({"queries": []}, {"queries": "x"}, {"queries": [1]}, {"queries": [" "]},
+                     {"queries": ["-!"], "normalized": True}, {"queries": ["x"] * 9}, {"queries": ["x" * 65]},
+                     {"match_mode": []}, {"line_count": False}, {"line_count": 33}, {"context_lines": -1},
+                     {"context_lines": 5}, {"limit": 0}, {"normalized": 1}, {"case_sensitive": "yes"}):
+            with self.subTest(args=args):
+                self.assertIn("error", search_memory(**({"queries": ["x"]} | args)))
+        self.seed("no-seq")
+        self.seed("orphan")
+        with closing(get_connection()) as conn, conn:
+            conn.execute("UPDATE stage1_outputs SET source_max_seq=NULL WHERE session_id='no-seq'")
+            conn.execute("DELETE FROM sessions WHERE session_id='orphan'")
+        self.assertFalse(search_memory(["杭州"])["results"])
+
+    def test_search_error_can_be_corrected_in_the_same_turn(self):
+        self.seed()
+        self.assertEqual(self.agent.max_steps, 30)
+        self.client.normal_responses = [
+            step(tool_call("bad", "search_memory", query="杭州")),
+            step(tool_call("good", "search_memory", queries=["杭州"])),
+            completion("乘公交", "A"),
+        ]
+        self.assertEqual(self.agent.ask("之前的偏好？"), "乘公交")
+        self.assertIn("error", json.loads(self.client.requests[1][0][-1]["content"]))
+        result = json.loads(self.client.requests[2][0][-1]["content"])
+        self.assertEqual(result["results"][0]["session_id"], "A")
+        self.assertEqual(self.usage()[0], 1)
+
+    def test_snippets_and_total_response_budget(self):
+        for i in range(10):
+            text = "前" * 1000 + "HANG-ZHOU" + "后" * 1000
+            self.seed(str(i), "\n".join([text] * 8), slug="long-lines")
+        report = search_memory(["hang zhou"], normalized=True, limit=10)
+        self.assertTrue(report["truncated"])
+        self.assertLess(len(report["results"]), 10)
+        self.assertLessEqual(len(json.dumps(report, ensure_ascii=False).encode()), MAX_OUTPUT_BYTES)
+        item = report["results"][0]
+        self.assertTrue(item["truncated"])
+        self.assertEqual(len(item["matches"]), MAX_MATCHES)
+        for index, match in enumerate(item["matches"], 1):
+            self.assertEqual(match["match_start_line"], index)
+            self.assertIn("HANG-ZHOU", match["content"])
+            self.assertLessEqual(len(match["content"]), MAX_CONTENT)
 
     def test_usage_survives_phase1_and_ranks_phase2(self):
         self.seed("A")

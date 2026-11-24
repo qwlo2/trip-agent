@@ -234,9 +234,14 @@ Agent 重新启动
    检索记忆采用tool，由记忆模块进行注册serach和read-tool（由于是tool-call会进入message
 和event-log）；LLM只在回答最终答案时，会根据具体使用了记忆，返回具体的session-id，在一轮
 turn中多次调用统一记忆，只再增加一次uasge，会进行去重在对sqlite中的usage进行更新
+（全局记忆生成也有token约束，不能无限大，在注入全局记忆时也采用限制，不过会保留开头和结尾，
+  并且只计算摘要的token数，检索函数参考codex）
 
     实施：
     在compact时暂时不对记忆的检索结果在特殊处理；usage也暂时不做幂等处理
+     
+    后续可以增加RAG，将search-tool进行混合检索，分别从现有的文本检索+向量检索得出答案
+  再进行去重、排序，得到检索结果。
 
    项目主要由3条线构成：
    一是session的event-log和compact
