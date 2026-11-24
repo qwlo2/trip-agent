@@ -37,8 +37,7 @@ def tool_call(call_id, name="echo", **arguments):
 
 def completion(answer, *session_ids):
     """创建一次符合 GuideAgent 终止协议的离线响应。"""
-    call = tool_call("finish", "finish_answer", answer=answer, used_session_ids=list(session_ids))
-    return response(None, calls=[call], finish="tool_calls")
+    return response(json.dumps({"answer": answer, "used_session_ids": list(session_ids)}, ensure_ascii=False))
 
 
 class FakeClient:
@@ -352,6 +351,7 @@ class CompactTests(unittest.TestCase):
         agent = GuideAgent(self.client, ToolExecutor(include_amap=False), self.session)
         self.assertEqual(agent.ask("继续"), "回答")
         self.assertIsNone(self.client.requests[0][1])
+        self.assertNotIn("response_format", self.client.requests[0][2])
         self.assertIsNotNone(self.client.requests[1][1])
         self.assertTrue(any(item.get("content") == "摘要" for item in self.client.requests[1][0]))
 

@@ -1,6 +1,8 @@
 """导游问答 Agent，串联 LLM、工具执行器和对话历史。"""
 
 import json
+import logging
+import sqlite3
 from dataclasses import asdict
 from typing import Any
 
@@ -23,6 +25,22 @@ SYSTEM_PROMPT = """你是一名中文旅游导游，帮助用户了解景点、�
 区分已查询的信息和一般建议；不要编造营业时间、票价、房价、实时天气或预订情况。
 查询结果不足时明确说明，并给出可行的后续建议。
 """
+
+
+def parse_final_answer(content: str | None) -> tuple[str, set[str]]:
+    """解析模型的最终 JSON，仅检查回答及来源字段格式。"""
+    if not isinstance(content, str) or not content.strip():
+        raise ValueError("最终回答不能为空")
+    result = json.loads(content)
+    if not isinstance(result, dict):
+        raise ValueError("最终回答必须是 JSON 对象")
+    answer = result.get("answer")
+    ids = result.get("used_session_ids")
+    if not isinstance(answer, str) or not answer.strip():
+        raise ValueError("answer 必须是非空字符串")
+    if not isinstance(ids, list) or not all(isinstance(item, str) for item in ids):
+        raise ValueError("used_session_ids 必须是字符串数组")
+    return answer, set(ids)
 
 
 class GuideAgent:
@@ -81,6 +99,9 @@ class GuideAgent:
             self.session.append_context(user_message, seq=user_event["seq"])
             memory_prompt = turn_memory_prompt()
             tools = self.session.get_tools()
+            response_format = {"type": "json_object"}
+            correction = None
+            retried_format = False
 
             for step in range(1, self.max_steps + 1):
                 self.session.append_history([{"type": "step/start", "turn": turn, "step": step}])
@@ -88,32 +109,41 @@ class GuideAgent:
                 self.session.compact_if_needed()
                 messages = self.session.context.build()
                 messages[0]["content"] += "\n\n" + memory_prompt
-                request_tokens = self.session.measure_context_tokens(messages)
+                if correction:
+                    messages.append({"role": "user", "content": correction})
+                    correction = None
+                request_tokens = self.session.tokens.measure_request(messages, tools, response_format=response_format)
                 if request_tokens + self.session.compact.max_output_tokens > self.session.compact.context_window:
                     raise RuntimeError("当前上下文仍超出模型输入预算，无法安全缩减，请调整容量或保留策略")
-                response = self.client.ask(messages, tools=tools, max_tokens=self.session.compact.max_output_tokens)
-                assistant_message = response.choices[0].message.model_dump(exclude_none=True)
+                response = self.client.ask(
+                    messages, tools=tools, response_format=response_format,
+                    max_tokens=self.session.compact.max_output_tokens,
+                )
+                choice = response.choices[0]
+                assistant_message = choice.message.model_dump(exclude_none=True)
                 usage = response.usage.model_dump() if response.usage is not None else None
                 assistant_event = self.session.append_history([{
                     "type": "message", "turn": turn, "step": step, "message": assistant_message,
                     "usage": usage,
                 }])[0]
                 self.session.append_context(assistant_message, usage=usage, seq=assistant_event["seq"])
-                final = self._run_tools(
-                    assistant_message.get("tool_calls", []), response.choices[0].finish_reason, turn, step,
-                )
-                if final is not None:
-                    answer, used_ids = final
-                    message = {"role": "assistant", "content": answer}
-                    event = self.session.append_history([{
-                        "type": "message", "turn": turn, "step": step,
-                        "source": "finish_answer", "message": message,
-                    }])[0]
-                    self.session.append_context(message, seq=event["seq"])
+                calls = assistant_message.get("tool_calls") or []
+                if calls:
+                    self._run_tools(calls, choice.finish_reason, turn, step)
+                elif choice.finish_reason == "stop":
+                    try:
+                        answer, used_ids = parse_final_answer(assistant_message.get("content"))
+                    except ValueError as exc:
+                        if retried_format:
+                            raise
+                        retried_format = True
+                        correction = f"上一条最终回答格式无效（{exc}）。请按系统给出的 JSON 示例重新回答。"
+                else:
+                    raise RuntimeError(f"模型响应未正常完成：{choice.finish_reason}")
 
                 self.session.append_history([{"type": "step/end", "turn": turn, "step": step}])
                 step_open = False
-                if final is not None:
+                if not calls and correction is None:
                     reason = TurnEndReason.COMPLETED
                     break
 
@@ -127,32 +157,25 @@ class GuideAgent:
             self.session.append_history([{"type": "turn/end", "turn": turn, "reason": reason.value}])
 
         if used_ids:
-            Phase2Store().record_usage(used_ids)
+            try:
+                Phase2Store().record_usage(used_ids)
+            except sqlite3.Error:
+                logging.getLogger(__name__).warning("回答已保存，记忆 Usage 更新失败", exc_info=True)
         return answer
 
     def _run_tools(
         self, calls: list[dict[str, Any]], finish_reason: str, turn: int, step: int,
-    ) -> tuple[str, set[str]] | None:
-        """逐个配对原始工具调用；只有单独且有效的结束调用才能提交回答。"""
-        if not calls:
-            raise ValueError("最终回答必须使用 finish_answer")
-        final = None
-        error = None
+    ) -> None:
+        """逐个配对工具结果，异常结束的批次只记录失败结果。"""
+        error = None if finish_reason == "tool_calls" else RuntimeError(f"模型未完整返回工具调用：{finish_reason}")
         for raw in calls:
             name = raw["function"]["name"]
             if error is not None:
                 result = {"error": "同批工具调用失败，本调用已跳过"}
-            elif name == "finish_answer" and len(calls) > 1:
-                result = {"error": "finish_answer 必须单独调用，请在获取工具结果后重新提交"}
             else:
                 try:
-                    if finish_reason != "tool_calls":
-                        raise ValueError("模型未完整返回工具调用")
                     call = Trip_Client.parse_tool_call(raw)
                     result = self.executor.call_tool(name, call.arguments)
-                    if name == "finish_answer":
-                        final = result
-                        result = {"accepted": True}
                 except Exception as exc:
                     # 先配齐本批结果再向外传播执行异常；局部检索参数错误可由模型修正。
                     result = {"error": str(exc)}
@@ -168,7 +191,6 @@ class GuideAgent:
             self.session.append_context(message, seq=event["seq"])
         if error is not None:
             raise error
-        return final
 
     def clear_history(self) -> None:
         """清空独立会话的历史；已登记的会话应创建新会话。"""
