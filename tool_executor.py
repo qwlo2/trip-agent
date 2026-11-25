@@ -3,12 +3,22 @@
 from __future__ import annotations
 
 import logging
+from enum import Enum
+from functools import partial
+from inspect import iscoroutinefunction
 from copy import deepcopy
 from pathlib import Path
 from typing import Any, Callable
 
 from MCP.amap_mcp import AmapMCP
+from runtime.blocking import blocking
 from settings_loader import load_settings
+
+
+class ToolExecutionMode(str, Enum):
+    SYNC = "sync"
+    ASYNC = "async"
+    BLOCKING = "blocking"
 
 
 class ToolExecutor:
@@ -19,7 +29,7 @@ class ToolExecutor:
     """
 
     def __init__(self, env_file: str | Path | None = None, *, include_amap: bool = True) -> None:
-        """加载高德配置，首次获取工具列表时发现 MCP 工具。
+        """加载高德配置，由 initialize() 发现 MCP 工具。
 
         Args:
             env_file: 配置文件路径，默认使用当前模块同目录下的 .env。
@@ -28,7 +38,7 @@ class ToolExecutor:
 
         未填写高德 Key 时不注册高德工具，仍可注册和执行其他工具。
         """
-        self._tools: dict[str, tuple[dict[str, Any], Callable[..., Any]]] = {}
+        self._tools: dict[str, tuple[dict[str, Any], Callable[..., Any], ToolExecutionMode]] = {}
         self._amap: AmapMCP | None = None
         if not include_amap:
             return
@@ -47,6 +57,7 @@ class ToolExecutor:
         description: str,
         parameters: dict[str, Any],
         handler: Callable[..., Any],
+        *, mode: ToolExecutionMode = ToolExecutionMode.SYNC,
     ) -> None:
         """注册工具描述和实现，供模型选择及执行器调用。
 
@@ -61,6 +72,8 @@ class ToolExecutor:
         """
         if name in self._tools:
             raise ValueError(f"工具已注册：{name}")
+        if iscoroutinefunction(handler) and mode != ToolExecutionMode.ASYNC:
+            raise ValueError("异步工具必须注册为 ASYNC")
         definition = {
             "type": "function",
             "function": {
@@ -69,26 +82,26 @@ class ToolExecutor:
                 "parameters": deepcopy(parameters),
             },
         }
-        self._tools[name] = (definition, handler)
+        self._tools[name] = (definition, handler, mode)
 
-    def get_all_tools(self) -> list[dict[str, Any]]:
-        """返回所有工具描述的副本，可直接传入 Trip_Client.ask(tools=...)。
-
-        返回值不包含 Python 函数，修改返回内容不会影响已注册工具。
-        """
+    async def initialize(self) -> None:
+        """发布执行器前完成 MCP 工具发现，失败时保留本地工具。"""
         if self._amap is not None:
             amap, self._amap = self._amap, None
             try:
-                tools = amap.list_tools()
+                tools = await amap.list_tools()
             except RuntimeError:
                 logging.getLogger(__name__).warning("无法获取高德 MCP 工具，请检查网络和 AMAP_API_KEY；本会话继续普通问答。")
             else:
                 for tool in tools:
                     self.register_tool(
                         tool.name, tool.description or tool.name, tool.inputSchema,
-                        amap.handler(tool.name),
+                        amap.handler(tool.name), mode=ToolExecutionMode.ASYNC,
                     )
-        return deepcopy([definition for definition, _ in self._tools.values()])
+
+    def get_all_tools(self) -> list[dict[str, Any]]:
+        """读取已注册 Schema 的副本。"""
+        return deepcopy([entry[0] for entry in self._tools.values()])
 
     def call_tool(self, name: str, arguments: dict[str, Any]) -> Any:
         """按名称执行一次工具调用并原样返回结果，不自动捕获执行异常。
@@ -101,5 +114,16 @@ class ToolExecutor:
             KeyError: 工具名称未注册。
             TypeError: 参数与工具函数签名不匹配。
         """
-        _, handler = self._tools[name]
+        _, handler, mode = self._tools[name]
+        if mode == ToolExecutionMode.ASYNC:
+            raise TypeError("同步入口不能执行异步工具")
+        return handler(**arguments)
+
+    async def call_tool_async(self, name: str, arguments: dict[str, Any]) -> Any:
+        """按注册模式执行，同批工具的顺序由 Agent 决定。"""
+        _, handler, mode = self._tools[name]
+        if mode == ToolExecutionMode.ASYNC:
+            return await handler(**arguments)
+        if mode == ToolExecutionMode.BLOCKING:
+            return await blocking(partial(handler, **arguments))
         return handler(**arguments)

@@ -30,7 +30,7 @@ class HistoryStore:
         self._events: dict[int, dict[str, Any]] = {}
         self._write_failed = False
 
-    def load(self, system_prompt: str) -> list[dict[str, Any]]:
+    def load(self, system_prompt: str, *, existing: bool = False) -> list[dict[str, Any]]:
         """读取事件并接续 seq；空历史先写入 seq=0、turn=0 的系统消息。
 
         未完成的末行不视为已提交事件，备份后截去；完整行损坏则明确报错。
@@ -50,13 +50,15 @@ class HistoryStore:
             records = []
 
         if records:
-            if any(record["seq"] != index for index, record in enumerate(records)):
+            if any(type(record["seq"]) is not int or record["seq"] != index for index, record in enumerate(records)):
                 raise ValueError("History seq 必须从 0 开始连续递增，不能重复或乱序")
             self._events = {record["seq"]: deepcopy(record) for record in records}
             self._next_seq = records[-1]["seq"] + 1
             self._write_failed = False
             return records
 
+        if existing:
+            raise ValueError("已登记会话缺少完整的系统消息")
         system_event = {
             "type": "message", "turn": 0,
             "message": {"role": "system", "content": system_prompt},
@@ -98,6 +100,13 @@ class HistoryStore:
             raise ValueError(f"History 中不存在来源 seq={seq}")
         return deepcopy(self._events[seq])
 
+    def turn_events(self, turn: int) -> list[dict[str, Any]]:
+        """返回最新一轮已经提交的事件，供独占的 Session 安全收尾。"""
+        start = self._next_seq
+        while start and self._events[start - 1]["turn"] == turn:
+            start -= 1
+        return [self._events[i] for i in range(start, self._next_seq)]
+
     def clear(self) -> None:
         """清空事件文件并重置 seq。"""
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -105,3 +114,85 @@ class HistoryStore:
         self._next_seq = 0
         self._events.clear()
         self._write_failed = False
+
+
+def tool_call_ids(message: dict[str, Any]) -> list[str]:
+    """在持久化前检查整批调用是否具有可逐个配对的 ID。"""
+    calls = message.get("tool_calls") or []
+    ids = [call.get("id") for call in calls]
+    if any(not isinstance(key, str) or not key.strip() for key in ids) or len(set(ids)) != len(ids):
+        raise ValueError("工具调用 ID 为空或同批重复")
+    return ids
+
+
+def track_message(message: dict[str, Any], pending: set[str]) -> None:
+    """按原始 ID 验证模型可见消息序列。"""
+    role = message["role"]
+    if role == "tool":
+        key = message.get("tool_call_id")
+        if key not in pending:
+            raise ValueError("工具结果 ID 无对应调用")
+        pending.remove(key)
+    elif pending:
+        raise ValueError("上批工具结果未闭合")
+    elif role == "assistant":
+        pending.update(tool_call_ids(message))
+    elif role not in {"system", "user"}:
+        raise ValueError("无效的消息角色")
+
+
+def validate_history(events: list[dict[str, Any]]) -> None:
+    """验证生命周期和原始工具配对，兼容早期仅记录消息的历史前缀。"""
+    first = events[0]
+    if (first["type"] != "message" or first["turn"] != 0 or first["message"]["role"] != "system"
+            or not isinstance(first["message"].get("content"), str)):
+        raise ValueError("缺少有效的 seq=0 系统消息")
+    turn = step = None
+    previous_turn = previous_step = 0
+    structured = False
+    legacy_turn = None
+    pending = set()
+    last_role = None
+    for event in events[1:]:
+        kind, number = event["type"], event["turn"]
+        if type(number) is not int or number < 0:
+            raise ValueError("无效的 Turn 编号")
+        if turn is not None and number != turn:
+            raise ValueError("事件不属于当前 Turn")
+        if kind == "turn/start":
+            if turn is not None or pending or number <= previous_turn:
+                raise ValueError("非法 turn/start")
+            structured = True
+            last_role = None
+            previous_turn = turn = number
+            previous_step = 0
+        elif kind == "step/start":
+            if turn is None or step is not None or type(event["step"]) is not int or event["step"] != previous_step + 1:
+                raise ValueError("非法 step/start")
+            previous_step = step = event["step"]
+        elif kind == "step/end":
+            if step is None or type(event["step"]) is not int or step != event["step"] or pending:
+                raise ValueError("非法 step/end")
+            step = None
+        elif kind == "turn/end":
+            if (turn is None and (structured or legacy_turn != number)) or step is not None or pending:
+                raise ValueError("非法 turn/end")
+            reason = TurnEndReason(event["reason"])
+            if reason == TurnEndReason.COMPLETED and (last_role != "assistant" or (structured and not previous_step)):
+                raise ValueError("completed Turn 缺少已结束的回答步骤")
+            turn = legacy_turn = None
+        elif kind == "message":
+            if event["message"]["role"] == "system":
+                raise ValueError("重复系统消息")
+            if structured and (turn is None or event.get("step") != step):
+                raise ValueError("消息不属于当前 Turn/Step")
+            if not structured:
+                if number < previous_turn or (pending and number != legacy_turn):
+                    raise ValueError("旧会话 Turn 顺序错误")
+                previous_turn = legacy_turn = number
+            last_role = event["message"]["role"]
+            track_message(event["message"], pending)
+        elif kind == "compaction/summary" and number != previous_turn:
+            raise ValueError("摘要不属于当前会话轮次")
+    if turn is not None or step is not None or pending:
+        raise ValueError("历史存在未闭合 Turn、Step 或工具调用")

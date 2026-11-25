@@ -2,7 +2,7 @@
 
 from memory.reader import read_memory, search_memory
 from memory.search import MATCH_MODES, MAX_CONTEXT, MAX_QUERIES, MAX_QUERY_CHARS, MAX_SESSIONS, MAX_WINDOW
-from tool_executor import ToolExecutor
+from tool_executor import ToolExecutionMode, ToolExecutor
 
 
 def register_memory_tools(executor: ToolExecutor) -> None:
@@ -22,8 +22,8 @@ def register_memory_tools(executor: ToolExecutor) -> None:
             "limit": {"type": "integer", "minimum": 1, "maximum": MAX_SESSIONS, "default": 5,
                       "description": "最多返回的会话数"},
         },
-    }, search_memory)
+    }, search_memory, mode=ToolExecutionMode.BLOCKING)
     executor.register_tool("read_memory", "按 Session ID 读取历史会话的局部摘要。", {
         "type": "object", "required": ["session_id"], "additionalProperties": False,
         "properties": {"session_id": {"type": "string"}},
-    }, read_memory)
+    }, read_memory, mode=ToolExecutionMode.BLOCKING)

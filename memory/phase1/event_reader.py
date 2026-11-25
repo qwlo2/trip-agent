@@ -80,6 +80,11 @@ class EventReader:
             record_bytes = end - begin + 1
             if record_bytes <= self.config["max_record_bytes"]:
                 event = json.loads(data[begin:end])
+                if event["seq"] == max_seq and (
+                    event["type"] != "turn/end" or event.get("reason") != "completed"
+                    or type(event.get("turn")) is not int or event["turn"] < 1
+                ):
+                    raise ValueError("Phase 1 来源必须为正常完成的 turn/end")
                 if max_seq is None or event["seq"] <= max_seq:
                     self.source_max_seq = max(self.source_max_seq, event["seq"])
                     if event["type"] == "message":

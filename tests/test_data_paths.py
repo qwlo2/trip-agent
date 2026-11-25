@@ -112,7 +112,10 @@ class DataPathsTests(unittest.TestCase):
         session.append_history([{
             "type": "message", "turn": 1, "message": {"role": "user", "content": "你好"},
         }])
-        self.assertTrue(Stage1Store().record_turn_end(session_id, 1, 100))
+        # 创建真实的日志完成边界，再验证水位可以随数据目录迁移。
+        session.history.append([{"type": "message", "turn": 1, "message": {"role": "assistant", "content": "你好"}},
+                                {"type": "turn/end", "turn": 1, "reason": "completed"}])
+        self.assertTrue(Stage1Store().record_turn_end(session_id, 3, 100))
         paths = get_data_paths()
         with closing(get_connection()) as conn, conn:
             conn.execute("UPDATE stage1_outputs SET rollout_summary = '旧摘要' WHERE session_id = ?", (session_id,))
@@ -127,13 +130,16 @@ class DataPathsTests(unittest.TestCase):
         get_data_paths.cache_clear()
         manager = SessionManager(None, "system", settings)
         self.assertEqual(manager.open(session_id).history.get(1)["message"]["content"], "你好")
-        self.assertEqual(EventReader.for_session(session_id, log_path=log_path).read()[0].seq, 1)
+        self.assertEqual(EventReader.for_session(session_id, log_path=log_path).read()[-1].seq, 1)
         with closing(get_connection()) as conn:
             row = conn.execute(
                 "SELECT rollout_summary FROM stage1_outputs WHERE session_id = ?", (session_id,),
             ).fetchone()
         self.assertEqual(row["rollout_summary"], "旧摘要")
-        self.assertTrue(Stage1Store().record_turn_end(session_id, 2, 101))
+        session = manager.open(session_id)
+        session.history.append([{"type": "message", "turn": 2, "message": {"role": "assistant", "content": "继续"}},
+                                {"type": "turn/end", "turn": 2, "reason": "completed"}])
+        self.assertTrue(Stage1Store().record_turn_end(session_id, 5, 101))
 
         paths = get_data_paths()
         legacy = paths.sessions / "legacy.jsonl"

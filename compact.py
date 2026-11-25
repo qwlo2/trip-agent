@@ -8,7 +8,8 @@ from datetime import datetime, timezone
 from math import floor
 from typing import TYPE_CHECKING, Any
 
-from client import Trip_Client
+from client import AsyncTripClient
+from runtime.blocking import blocking
 from context_builder import SurfaceNode
 if TYPE_CHECKING:
     from session import Session
@@ -56,7 +57,7 @@ class Compact:
     """自动及手动压缩共用的实现，会话由调用方临时传入，不持有 Session。"""
 
     def __init__(
-        self, client: Trip_Client, *,
+        self, client: AsyncTripClient, *,
         context_window: int, max_output_tokens: int,
         threshold_ratio: float, retain_ratio: float,
     ) -> None:
@@ -113,29 +114,29 @@ class Compact:
             return None
         return CompactRange(1, keep_from, nodes[1:keep_from])
 
-    def compact_if_needed(self, session: Session) -> CompactResult:
+    async def compact_if_needed(self, session: Session) -> CompactResult:
         """准备模型请求时计量有效消息及工具 Schema，达到 T 后自动压缩。"""
-        count = session.measure_context_tokens()
+        count = await blocking(session.measure_context_tokens)
         if count < self.threshold:
             self.last_result = CompactResult("skipped", "below_threshold", count, count)
             return self.last_result
-        return self.compact_now(session, source="auto")
+        return await self.compact_now(session, source="auto")
 
-    def summarize(self, selection: CompactRange) -> tuple[str, dict[str, Any] | None]:
+    async def summarize(self, selection: CompactRange) -> tuple[str, dict[str, Any] | None]:
         """独立调用 LLM 生成摘要，不提供业务工具，不进入普通 Agent 循环。"""
         messages = [
             {"role": "system", "content": SUMMARY_PROMPT},
-            {"role": "user", "content": json.dumps(
+            {"role": "user", "content": await blocking(json.dumps,
                 [node.message for node in selection.nodes], ensure_ascii=False,
             )},
         ]
-        response = self.client.ask(messages, tools=None, tool_choice="none", max_tokens=self.max_output_tokens)
+        response = await self.client.ask(messages, tools=None, tool_choice="none", max_tokens=self.max_output_tokens)
         choice = response.choices[0]
         message = choice.message
         usage = response.usage.model_dump() if response.usage is not None else None
         return message.content.strip(), usage
 
-    def compact_now(
+    async def compact_now(
         self, session: Session, *, source: str = "manual",
     ) -> CompactResult:
         """自动及 LLM 工具调用共用的执行入口，只压缩已闭合的历史前缀。
@@ -143,13 +144,13 @@ class Compact:
         工具调用过程中保留当前未闭合调用所在的尾部；没有非空安全范围时跳过。
         session 仅作为本次调用参数使用，不保存在 Compact 对象中。
         """
-        before = session.measure_context_tokens()
-        selection = self.select_compactable_range(session)
+        before = await blocking(session.measure_context_tokens)
+        selection = await blocking(self.select_compactable_range, session)
         if selection is None:
             result = CompactResult("skipped", "no_safe_range", before, before)
         else:
-            summary, usage = self.summarize(selection)
-            result = self.commit_compaction(session, selection, summary, usage, source)
+            summary, usage = await self.summarize(selection)
+            result = await blocking(self.commit_compaction, session, selection, summary, usage, source)
         self.last_result = result
         return result
 

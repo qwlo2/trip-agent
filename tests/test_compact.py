@@ -15,7 +15,7 @@ from compact import Compact
 from context_builder import ContextBuilder, SurfaceNode
 from history import HistoryStore
 from main import load_compact_settings
-from session import Session
+from session import Session, SessionIntegrityError
 from tool_executor import ToolExecutor
 
 
@@ -65,7 +65,12 @@ class FakeClient:
     parse_response = staticmethod(Trip_Client.parse_response)
 
 
-class CompactTests(unittest.TestCase):
+class FakeAsyncClient(FakeClient):
+    async def ask(self, messages, tools=None, **options):
+        return super().ask(messages, tools, **options)
+
+
+class CompactTests(unittest.IsolatedAsyncioTestCase):
     """验证阈值、配对缓存、压缩事务、日志重放和 Agent 工具边界。"""
 
     def setUp(self):
@@ -73,7 +78,7 @@ class CompactTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.path = Path(self.temp.name) / "history.jsonl"
-        self.client = FakeClient()
+        self.client = FakeAsyncClient()
         self.compact_settings = {
             "context_window": 2000, "max_output_tokens": 100,
             "threshold_ratio": 0.3, "retain_ratio": 0.05,
@@ -94,7 +99,7 @@ class CompactTests(unittest.TestCase):
 
     def reopen(self):
         """仅依赖日志重建新的会话，不复用任何投影或缓存。"""
-        compact = Compact(FakeClient(), **self.compact_settings)
+        compact = Compact(FakeAsyncClient(), **self.compact_settings)
         return Session(HistoryStore(self.path), ContextBuilder(), "unused", compact)
 
     def test_threshold_and_configuration(self):
@@ -121,20 +126,20 @@ class CompactTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "COMPACT_THRESHOLD_RATIO"):
             load_compact_settings({**settings, "COMPACT_THRESHOLD_RATIO": ""})
 
-    def test_below_threshold(self):
+    async def test_below_threshold(self):
         """低压力请求不调用摘要模型，也不写日志。"""
         original = self.path.read_bytes()
-        result = self.session.compact_if_needed()
+        result = await self.session.compact_if_needed()
         self.assertEqual(result.reason, "below_threshold")
         self.assertFalse(self.client.requests)
         self.assertEqual(original, self.path.read_bytes())
 
-    def test_threshold_trigger_and_position(self):
+    async def test_threshold_trigger_and_position(self):
         """达到 T 后按 K 留下尾部，摘要原位替换且保护 seq0。"""
         self.populate()
         original = self.session.context.nodes()
         original_log = self.path.read_bytes()
-        result = self.session.compact_if_needed()
+        result = await self.session.compact_if_needed()
         self.assertEqual(result.status, "compacted")
         nodes = self.session.context.nodes()
         self.assertEqual(nodes[0], original[0])
@@ -149,7 +154,7 @@ class CompactTests(unittest.TestCase):
         self.assertIsNone(self.client.requests[0][1])
         self.assertEqual(self.client.requests[0][2]["tool_choice"], "none")
 
-    def test_request_measurement_includes_tools(self):
+    async def test_request_measurement_includes_tools(self):
         """工具 Schema 参与请求计量，非模型日志不进入当前上下文。"""
         before = self.session.count_context_tokens()
         tools = [{"type": "function", "function": {"name": "large", "description": "x" * 3000}}]
@@ -159,7 +164,7 @@ class CompactTests(unittest.TestCase):
         self.session.tools_provider = None
         self.session.append_history([{"type": "tool/call", "turn": 1, "payload": "x" * 10000}])
         self.assertEqual(self.session.count_context_tokens(), before)
-        self.assertEqual(self.session.compact_if_needed().reason, "below_threshold")
+        self.assertEqual((await self.session.compact_if_needed()).reason, "below_threshold")
 
     def test_parallel_tools_move_boundary_backward(self):
         """并行调用按数量平衡，无论结果顺序如何都不拆开整组工具消息。"""
@@ -174,7 +179,7 @@ class CompactTests(unittest.TestCase):
         self.assertEqual([node.seq for node in selection.nodes], [user_seq])
         self.assertEqual(self.session.context.nodes(selection.end)[0].seq, call_seq)
 
-    def test_cache_incremental_and_generation(self):
+    async def test_cache_incremental_and_generation(self):
         """缓存无变化时复用，Append 扩展，Replace 后才重建。"""
         cache = self.compact.ensure_balance_cache(self.session)
         self.assertIs(cache, self.compact.ensure_balance_cache(self.session))
@@ -186,32 +191,32 @@ class CompactTests(unittest.TestCase):
             self.assertEqual(scan.call_count, 1)
         self.populate()
         old_generation = cache.generation
-        self.assertEqual(self.session.compact_now().status, "compacted")
+        self.assertEqual((await self.session.compact_now()).status, "compacted")
         rebuilt = self.compact.ensure_balance_cache(self.session)
         self.assertIsNot(rebuilt, cache)
         self.assertGreater(rebuilt.generation, old_generation)
         self.assertEqual(len(rebuilt.cut_balanced), len(self.session.context) + 1)
 
-    def test_pending_and_no_safe_range(self):
+    async def test_pending_and_no_safe_range(self):
         """没有非空安全范围时跳过，不因工具调用而引入延后调度。"""
         self.add({"role": "user", "content": "x" * 1000})
-        self.assertEqual(self.session.compact_now().reason, "no_safe_range")
+        self.assertEqual((await self.session.compact_now()).reason, "no_safe_range")
         self.add({"role": "assistant", "tool_calls": [tool_call("a")]})
-        self.assertEqual(self.session.compact_now().reason, "no_safe_range")
+        self.assertEqual((await self.session.compact_now()).reason, "no_safe_range")
         self.assertFalse(self.client.requests)
 
-    def test_summary_error_propagates(self):
+    async def test_summary_error_propagates(self):
         """摘要请求异常直接传播，已有历史和消息保持不变。"""
         self.populate()
         original_nodes = self.session.context.nodes()
         original_log = self.path.read_bytes()
         self.client.summary_response = TimeoutError("offline")
         with self.assertRaises(TimeoutError):
-            self.session.compact_now()
+            await self.session.compact_now()
         self.assertEqual(self.session.context.nodes(), original_nodes)
         self.assertEqual(self.path.read_bytes(), original_log)
 
-    def test_changed_range_aborts_commit(self):
+    async def test_changed_range_aborts_commit(self):
         """摘要目标已被替换时由 Session 投影层报错，不转换失败状态。"""
         self.populate()
         self.client.on_summary = lambda: self.session.context.replace(
@@ -219,16 +224,16 @@ class CompactTests(unittest.TestCase):
         )
         original_log = self.path.read_bytes()
         with self.assertRaises(ValueError):
-            self.session.compact_now()
+            await self.session.compact_now()
         self.assertEqual(self.path.read_bytes(), original_log)
 
-    def test_multiple_compactions_and_replay(self):
+    async def test_multiple_compactions_and_replay(self):
         """摘要可再压缩，来源 seq 非数值连续时仍按 Surface 顺序重放。"""
         self.populate()
-        first = self.session.compact_now()
+        first = await self.session.compact_now()
         for role in ("user", "assistant", "user"):
             self.add({"role": role, "content": "y" * 600})
-        second = self.session.compact_now()
+        second = await self.session.compact_now()
         self.assertEqual(second.status, "compacted")
         source = self.session.history.get(second.summary_seq)["data"]["shadowedSeqs"]
         self.assertIn(first.summary_seq, source)
@@ -237,19 +242,19 @@ class CompactTests(unittest.TestCase):
         self.assertEqual(self.reopen().context.replace_generation, 2)
         self.assertIn("摘要", self.client.requests[-1][0][1]["content"])
 
-    def test_append_during_summary_is_compatible(self):
+    async def test_append_during_summary_is_compatible(self):
         """摘要生成期间仅尾部追加消息，不改变目标范围时仍可提交。"""
         self.populate()
         self.client.on_summary = lambda: self.add({"role": "user", "content": "new" * 1000})
-        result = self.session.compact_now()
+        result = await self.session.compact_now()
         self.assertEqual(result.status, "compacted")
         self.assertEqual(self.session.context.nodes()[-1].message["content"], "new" * 1000)
         self.assertEqual(self.reopen().context.nodes(), self.session.context.nodes())
 
-    def test_replay_rejects_invalid_range_and_seq0(self):
+    async def test_replay_rejects_invalid_range_and_seq0(self):
         """日志中的无效目标、逆序范围及 seq0 替换不会被重放。"""
         self.populate()
-        result = self.session.compact_now()
+        result = await self.session.compact_now()
         good = self.path.read_text()
         records = [json.loads(line) for line in good.splitlines()]
         for source in ([0, 1], [2, 1], [999]):
@@ -269,13 +274,13 @@ class CompactTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.reopen()
 
-    def test_crash_after_log_commit_replays_replace(self):
+    async def test_crash_after_log_commit_replays_replace(self):
         """日志已提交而内存替换尚未完成时，重启按提交记录完成投影。"""
         self.populate()
         before = self.session.context.nodes()
         with patch.object(self.session.context, "replace", side_effect=RuntimeError("simulated crash")):
             with self.assertRaises(RuntimeError):
-                self.session.compact_now()
+                await self.session.compact_now()
         self.assertEqual(self.session.context.nodes(), before)
         with self.assertRaisesRegex(RuntimeError, "投影"):
             self.session.append_history([{"type": "turn/start", "turn": 2}])
@@ -287,17 +292,18 @@ class CompactTests(unittest.TestCase):
         """持久化失败后禁止用过期 seq 继续写入，重启以实际日志为准。"""
         event = {"type": "message", "turn": 1, "message": {"role": "user", "content": "saved"}}
         with patch("history.os.fsync", side_effect=OSError("disk failure")):
-            with self.assertRaises(OSError):
+            with self.assertRaisesRegex(SessionIntegrityError, "disk failure") as caught:
                 self.session.append_history([event])
+            self.assertIsInstance(caught.exception.__cause__, OSError)
         with self.assertRaisesRegex(RuntimeError, "重启"):
             self.session.append_history([event])
         restored = self.reopen()
         self.assertEqual(restored.context.nodes()[-1].message["content"], "saved")
 
-    def test_incomplete_commit_is_not_replayed(self):
+    async def test_incomplete_commit_is_not_replayed(self):
         """写到一半的摘要末行保留备份但不成为有效提交。"""
         self.populate()
-        self.session.compact_now()
+        await self.session.compact_now()
         committed = self.path.read_bytes()
         with self.path.open("ab") as target:
             target.write(b'{"seq":99,"type":"compaction/summary"')
@@ -315,7 +321,7 @@ class CompactTests(unittest.TestCase):
         self.assertIs(cache, self.compact.ensure_balance_cache(self.session))
         self.assertEqual(cache.in_progress_tool_calls, 1)
 
-    def test_manual_tool_directly_calls_compact_now(self):
+    async def test_manual_tool_directly_calls_compact_now(self):
         """LLM 工具直接执行公共压缩函数，未完成的整组调用保留在尾部。"""
         self.populate()
         compact = Compact(
@@ -333,7 +339,7 @@ class CompactTests(unittest.TestCase):
         self.client.on_summary = lambda: observed_pending.append(compact.ensure_balance_cache(self.session).in_progress_tool_calls)
         agent = GuideAgent(self.client, executor, self.session)
         self.assertEqual(executor._tools["compact_context"][1], self.session.compact_now)
-        self.assertEqual(agent.ask("请压缩上下文"), "完成")
+        self.assertEqual((await agent.ask("请压缩上下文")), "完成")
         self.assertEqual(observed_pending, [2])
         records = [json.loads(line) for line in self.path.read_text().splitlines()]
         summary = next(item for item in records if item["type"] == "compaction/summary")
@@ -344,12 +350,12 @@ class CompactTests(unittest.TestCase):
         self.assertEqual(compact.ensure_balance_cache(self.session).in_progress_tool_calls, 0)
         self.assertEqual(self.reopen().context.nodes(), self.session.context.nodes())
 
-    def test_agent_auto_compacts_before_request(self):
+    async def test_agent_auto_compacts_before_request(self):
         """Agent 在普通请求之前自动摘要，并发送已替换的消息。"""
         self.populate()
         self.client.normal_responses = [completion("回答")]
         agent = GuideAgent(self.client, ToolExecutor(include_amap=False), self.session)
-        self.assertEqual(agent.ask("继续"), "回答")
+        self.assertEqual(await agent.ask("继续"), "回答")
         self.assertIsNone(self.client.requests[0][1])
         self.assertNotIn("response_format", self.client.requests[0][2])
         self.assertIsNotNone(self.client.requests[1][1])

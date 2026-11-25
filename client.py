@@ -7,7 +7,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Sequence
 
-from openai import OpenAI
+from openai import AsyncOpenAI, OpenAI
 from openai.types.chat import ChatCompletion
 
 from settings_loader import load_settings
@@ -47,11 +47,10 @@ class Message:
     metadata: dict[str, Any] = field(default_factory=dict)
     """ field用来配置数据类中的成员变量,default_factory 的设计就是为了让每个实例获得独立的默认对象。"""
 
-class Trip_Client:
-    """封装 DeepSeek 的非流式询问和响应解析，工具列表由调用方传入。
+class _TripClientBase:
+    """共享同步与异步请求的配置、参数及响应协议。"""
 
-    工具执行和对话历史由调用方管理。支持 with 语句，退出时关闭连接。
-    """
+    sdk_class = OpenAI
 
     def __init__(self, env_file: str | Path | None = None) -> None:
         """加载配置并创建 SDK 客户端，不在初始化时发送请求。
@@ -74,45 +73,17 @@ class Trip_Client:
             },
         )
         self.model = config["DEEPSEEK_MODEL"]
-        self._api = OpenAI(
+        self._api = self.sdk_class(
             api_key=config["DEEPSEEK_API_KEY"],
             base_url=config["DEEPSEEK_BASE_URL"],
             timeout=config["DEEPSEEK_TIMEOUT"],
             max_retries=0,
         )
 
-    def ask(
-        self,
-        messages: Sequence[dict[str, Any]],
-        tools: Sequence[dict[str, Any]] | None = None,
-        *,
-        tool_choice: str | dict[str, Any] = "auto",
-        temperature: float | None = None,
-        max_tokens: int | None = None,
-        response_format: dict[str, Any] | None = None,
-    ) -> ChatCompletion:
-        """
-        str | dict[str, Any]相当于union,
-        值	含义
-        "auto"	模型自主决定是否调用工具
-        "none"	不调用工具
-        "required"	必须调用工具
-        """
-        """发送一次非流式请求，直接返回 SDK 响应，不修改或保存对话历史。
-
-        Args:
-            messages: OpenAI 兼容格式的消息序列，由调用方维护完整历史。
-            tools: ToolExecutor.get_all_tools() 返回的工具描述列表，可省略。
-            tool_choice: 工具选择策略，仅在传入非空工具列表时发送给 API。
-            temperature: 可选采样温度，None 表示采用服务端默认值。
-            max_tokens: 可选的最大输出 token 数，None 表示采用服务端默认值。
-            response_format: 可选输出格式，例如 {"type": "json_object"}。
-
-        Returns:
-            OpenAI SDK 返回的原始 ChatCompletion 响应，由调用方决定何时解析。
-
-        网络及 API 错误直接向调用方抛出。
-        """
+    def _request(self, messages: Sequence[dict[str, Any]], tools: Sequence[dict[str, Any]] | None,
+                 *, tool_choice: str | dict[str, Any] = "auto", temperature: float | None = None,
+                 max_tokens: int | None = None, response_format: dict[str, Any] | None = None) -> dict[str, Any]:
+        """构造 Chat Completions 参数；无工具时省略工具选项。"""
         options: dict[str, Any] = {}
         if tools:
             options["tools"] = list(tools)
@@ -124,13 +95,7 @@ class Trip_Client:
         if response_format is not None:
             options["response_format"] = response_format
 
-        response = self._api.chat.completions.create(
-            model=self.model,
-            messages=messages,
-            stream=False,
-            **options,
-        )
-        return response
+        return dict(model=self.model, messages=messages, stream=False, **options)
 
     @staticmethod
     def parse_response(response: ChatCompletion) -> Message:
@@ -171,6 +136,32 @@ class Trip_Client:
         if not isinstance(arguments, dict):
             raise ValueError(f"工具 {function['name']} 的参数必须为 JSON 对象")
         return ToolCall(call["id"], function["name"], arguments)
+
+class AsyncTripClient(_TripClientBase):
+    """前台任务共享的异步客户端。"""
+
+    sdk_class = AsyncOpenAI
+
+    async def ask(self, messages: Sequence[dict[str, Any]], tools: Sequence[dict[str, Any]] | None = None, *,
+                  tool_choice: str | dict[str, Any] = "auto", temperature: float | None = None,
+                  max_tokens: int | None = None, response_format: dict[str, Any] | None = None) -> ChatCompletion:
+        options = self._request(messages, tools, tool_choice=tool_choice, temperature=temperature,
+                                max_tokens=max_tokens, response_format=response_format)
+        return await self._api.chat.completions.create(**options)
+
+    async def close(self) -> None:
+        await self._api.close()
+
+
+class Trip_Client(_TripClientBase):
+    """启动记忆流水线使用的同步客户端。"""
+
+    def ask(self, messages: Sequence[dict[str, Any]], tools: Sequence[dict[str, Any]] | None = None, *,
+            tool_choice: str | dict[str, Any] = "auto", temperature: float | None = None,
+            max_tokens: int | None = None, response_format: dict[str, Any] | None = None) -> ChatCompletion:
+        options = self._request(messages, tools, tool_choice=tool_choice, temperature=temperature,
+                                max_tokens=max_tokens, response_format=response_format)
+        return self._api.chat.completions.create(**options)
 
     def close(self) -> None:
         """关闭底层 SDK 客户端，释放 HTTP 连接资源。"""

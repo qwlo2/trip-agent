@@ -49,14 +49,13 @@ VS Code 的默认 Python 解释器已配置为 `.venv/bin/python`。若仍提示
 
 启动时每页展示最多 25 个未归档会话，按打开次数降序排列。
 输入编号打开会话，输入 `0` 新建，使用 `n` 和 `p` 翻页。
-进入会话后，可以提问“杭州有哪些适合亲子游的景点？”，再追问“帮我查一下西湖附近的餐厅”。
-输入 `/sessions` 切换会话，`/clear` 创建并进入新会话（保留旧历史），
-`/compact` 请求压缩，`exit` 或 `quit` 退出。
-也可以要求导游压缩上下文，由模型调用 `compact_context` 工具。
+输入问题或 `/compact` 后立即得到任务 ID。用 `/tasks` 查看列表、`/status <id>` 查看状态、
+`/wait <id>` 等待结果或 `/result <id>` 查看回答及错误。
+`/sessions`、`/switch` 可在任务运行时切换会话，`/clear` 创建新会话并保留旧历史。
+`/exit`、`exit`、`quit` 或 EOF 会等待所有已接受的任务结束。
 
-Agent 每轮自动询问模型、执行模型请求的所有工具、回传结果，直到生成回复。
-每个问题最多请求模型 30 次，可通过 `GuideAgent(..., max_steps=...)` 调整。
-工具和 API 错误直接抛出；达到次数上限仍未完成时也会抛出异常，进度保留。
+每个会话同时接受一个 Turn 或手动压缩。默认并发执行 4 个任务，最多接收 32 个排队和运行中的任务，
+保留最近 128 条终态记录。Turn 内按顺序执行工具，最多请求模型 30 步。
 
 ### 数据目录
 
@@ -85,28 +84,28 @@ Phase 1 和 Phase 2 的记忆文件位置由 `DataPaths` 提供。
 
 ```python
 from agent import SYSTEM_PROMPT
-from client import Trip_Client
+import asyncio
 from main import load_compact_settings
+from runtime.manager import RuntimeManager
 from session_manager import SessionManager
 
-with Trip_Client() as client:
-    manager = SessionManager(client, SYSTEM_PROMPT, load_compact_settings())
-    session = manager.create("杭州旅游")
-    sessions = manager.get_sessions()
-    session = manager.open(session.session_id)
+async def run_trip():
+    directory = await asyncio.to_thread(SessionManager, None, SYSTEM_PROMPT, load_compact_settings())
+    session_id = await asyncio.to_thread(directory.create_id, "杭州旅游")
+    runtime = RuntimeManager(directory)
+    try:
+        await runtime.start(session_id)
+        task_id = runtime.submit(session_id, "杭州有哪些适合亲子游的景点？")
+        result = await runtime.wait(task_id)
+        print(result["error"] or result["answer"])
+    finally:
+        await runtime.shutdown()
+
+asyncio.run(run_trip())
 ```
 
-- `create(name)`：创建日志和 `sessions`、`stage1_outputs` 表项，返回新会话。
-- `open(session_id)`：重放日志并返回 `Session`；每次成功打开将使用次数加 1。
-- `get_sessions(limit=25, offset=0)`：按使用次数降序列出未归档会话，
-  同次数时新会话优先；`cache` 保存本页的 `{session_id: event_log_path}`。
-  默认数量参考 [Codex 会话选择器的 PAGE_SIZE](https://github.com/openai/codex/blob/main/codex-rs/tui/src/resume_picker.rs)。
-- `archived(session_id, is_archived=True)`：设置归档标记；传入 `False` 恢复展示。
-- `delete(session_id)`：删除日志、会话表项、局部记忆和对应 Phase 1 任务；
-  已有全局记忆在后续 Phase 2 筛选时淘汰。
-
-将返回的 `session` 传入 `GuideAgent(client, executor, session)` 即可问答。
-管理器只缓存列表中的路径，打开时重新加载对应日志和上下文；客户端由调用方关闭。
+`SessionManager` 管理目录。用户选择会话时增加使用次数，Runtime 首次执行任务时独占加载并验证日志。
+运行期间通过 Runtime 的创建、选择、分页、归档和删除接口访问目录。删除先提交 SQLite，再清理日志。
 命令行从 `sessions` 表列出已登记的会话。
 此前由独立问答入口生成、尚未登记的 `sessions/default/events.jsonl` 或 `history.jsonl`
 仍可通过 `HistoryStore()` 读取，启动时不会自动导入。
@@ -277,32 +276,39 @@ Compact 直接使用摘要正文，记录替换前后的 Token 成本，不额�
 ```python
 import json
 
-from client import Trip_Client
+import asyncio
+from client import AsyncTripClient
 from tool_executor import ToolExecutor
 
-executor = ToolExecutor()
-tools = executor.get_all_tools()
+async def query():
+    executor = ToolExecutor()
+    await executor.initialize()
+    tools = executor.get_all_tools()
+    client = AsyncTripClient()
+    try:
+        messages = [{"role": "user", "content": "帮我查一下杭州的博物馆和西湖附近的酒店。"}]
+        response = await client.ask(messages, tools=tools)
+        messages.append(response.choices[0].message.model_dump(exclude_none=True))
+        result = client.parse_response(response)
+        print(result.content)
 
-with Trip_Client() as client:
-    messages = [{"role": "user", "content": "帮我查一下杭州的博物馆和西湖附近的酒店。"}]
-    response = client.ask(messages, tools=tools)
-    messages.append(response.choices[0].message.model_dump(exclude_none=True))
-    result = client.parse_response(response)
-    print(result.content)
+        # 一次响应可以包含多个工具调用，全部执行并回传后再询问模型。
+        if result.tool_calls:
+            for call in result.tool_calls:
+                data = await executor.call_tool_async(call.name, call.arguments)
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": call.id,
+                    "content": json.dumps(data, ensure_ascii=False),
+                })
+            next_response = await client.ask(messages, tools=tools)
+            messages.append(next_response.choices[0].message.model_dump(exclude_none=True))
+            next_result = client.parse_response(next_response)
+            print(next_result.content)
+    finally:
+        await client.close()
 
-    # 一次响应可以包含多个工具调用，全部执行并回传后再询问模型。
-    if result.tool_calls:
-        for call in result.tool_calls:
-            data = executor.call_tool(call.name, call.arguments)
-            messages.append({
-                "role": "tool",
-                "tool_call_id": call.id,
-                "content": json.dumps(data, ensure_ascii=False),
-            })
-        next_response = client.ask(messages, tools=tools)
-        messages.append(next_response.choices[0].message.model_dump(exclude_none=True))
-        next_result = client.parse_response(next_response)
-        print(next_result.content)
+asyncio.run(query())
 ```
 
 此底层接口示例只演示一次工具调用批次；完整循环由 `GuideAgent` 实现。
@@ -319,12 +325,12 @@ with Trip_Client() as client:
 - `call_tool(name, arguments)`：按名称执行工具并返回结果，未知名称抛出 `KeyError`，
   工具异常直接向调用方传播。JSON Schema 用于模型侧描述，不进行本地 Schema 校验。
 
-配置 `AMAP_API_KEY` 后，执行器首次获取工具列表时通过 Streamable HTTP 连接
+配置 `AMAP_API_KEY` 后，执行器在异步 initialize() 中通过 Streamable HTTP 连接
 [高德官方 MCP](https://lbs.amap.com/api/mcp-server/gettingstarted)。
 只注册服务端返回的地点搜索、周边搜索、地点详情以及步行、驾车、公交路线工具，
 参数定义以 MCP 返回的 Schema 为准。坐标应从高德搜索结果取得。
 MCP 查询失败时，工具返回错误结果给模型；工具发现失败时，当前执行器仍可使用本地工具，
-重新启动或切换会话后可重新发现。
+新建执行器时可重新发现。
 
 从旧版本升级时，先运行 `.venv/bin/python -m pip install -r requirements.txt`。
 

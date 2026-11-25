@@ -17,8 +17,9 @@ from database.stage1_store import Stage1Store
 from memory.reader import search_memory, truncate_middle_with_token_budget, turn_memory_prompt
 from memory.search import MAX_CONTENT, MAX_MATCHES, MAX_OUTPUT_BYTES
 from memory.memory_maneger import MemoryManager
+from session import SessionIntegrityError
 from session_manager import SessionManager
-from test_compact import FakeClient, completion, response, tool_call
+from test_compact import FakeAsyncClient, FakeClient, completion, response, tool_call
 from tool_executor import ToolExecutor
 
 
@@ -26,7 +27,7 @@ def step(*calls):
     return response(None, calls=list(calls), finish="tool_calls")
 
 
-class MemoryUsageTests(unittest.TestCase):
+class MemoryUsageTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         temp = TemporaryDirectory()
         self.addCleanup(temp.cleanup)
@@ -35,7 +36,7 @@ class MemoryUsageTests(unittest.TestCase):
         self.addCleanup(env.stop)
         get_data_paths.cache_clear()
         self.addCleanup(get_data_paths.cache_clear)
-        self.client = FakeClient()
+        self.client = FakeAsyncClient()
         self.manager = SessionManager(self.client, "导游", {
             "context_window": 32000, "max_output_tokens": 500, "threshold_ratio": .85, "retain_ratio": .1,
         })
@@ -63,7 +64,7 @@ class MemoryUsageTests(unittest.TestCase):
                 "SELECT usage_count,last_usage FROM stage1_outputs WHERE session_id=?", (sid,),
             ).fetchone())
 
-    def test_snapshot_retrieval_feedback_and_replay(self):
+    async def test_snapshot_retrieval_feedback_and_replay(self):
         self.seed(allow=0)
         self.seed("B", "苏州园林", "suzhou")
         self.seed("C", "只有全局记忆用到此来源", "global")
@@ -78,7 +79,7 @@ class MemoryUsageTests(unittest.TestCase):
             completion("继续坐公交", "A"),
         ]
         with patch.object(Phase2Store, "record_usage", autospec=True, side_effect=Phase2Store.record_usage) as record:
-            self.assertEqual(self.agent.ask("按我的偏好规划"), "乘公交去园林")
+            self.assertEqual((await self.agent.ask("按我的偏好规划")), "乘公交去园林")
             self.assertEqual(record.call_args.args[1], {"A", "B", "C"})
             record.assert_called_once()
         self.assertEqual(self.usage()[0], 1)
@@ -116,23 +117,23 @@ class MemoryUsageTests(unittest.TestCase):
         self.assertEqual(surface[0]["content"], "导游")
         self.assertNotIn("快照甲", self.session.history.path.read_text())
         agent = GuideAgent(self.client, ToolExecutor(include_amap=False), replay)
-        self.assertEqual(agent.ask("继续"), "继续坐公交")
+        self.assertEqual(await agent.ask("继续"), "继续坐公交")
         self.assertIn("快照乙", self.client.requests[-1][0][0]["content"])
         self.assertIn(surface[-1], self.client.requests[-1][0])
         self.assertEqual(self.usage()[0], 2)
         self.assertEqual(self.usage("B")[0], 1)
 
-    def test_missing_and_blank_global_memory(self):
+    async def test_missing_and_blank_global_memory(self):
         self.client.normal_responses = [completion("你好"), completion("你好")]
         with patch.object(Phase2Store, "record_usage") as record:
-            self.assertEqual(self.agent.ask("你好"), "你好")
+            self.assertEqual((await self.agent.ask("你好")), "你好")
             self.path.write_text(" \n")
-            self.assertEqual(self.agent.ask("你好"), "你好")
+            self.assertEqual((await self.agent.ask("你好")), "你好")
             record.assert_not_called()
         self.assertEqual(len(self.client.requests), 2)
         self.assertEqual(self.client.requests[0][0][0], self.client.requests[1][0][0])
 
-    def test_legacy_session_replays_and_continues_without_terminal_tool(self):
+    async def test_legacy_session_replays_and_continues_without_terminal_tool(self):
         legacy = [
             {"role": "user", "content": "旧问题"},
             {"role": "assistant", "tool_calls": [tool_call("lookup", "search_memory", query="杭州")]},
@@ -152,7 +153,7 @@ class MemoryUsageTests(unittest.TestCase):
         reply.choices[0].message.reasoning_content = "当前回答依据"
         self.client.normal_responses = [reply]
         with patch.object(Phase2Store, "record_usage") as usage:
-            self.assertEqual(agent.ask("新问题"), "新答案")
+            self.assertEqual((await agent.ask("新问题")), "新答案")
             usage.assert_not_called()
         messages, tools, _ = self.client.requests[0]
         self.assertEqual(messages[1:-1], legacy)
@@ -172,24 +173,24 @@ class MemoryUsageTests(unittest.TestCase):
             with self.subTest(content=content), self.assertRaises(ValueError):
                 parse_final_answer(content)
 
-    def test_format_correction_within_loop(self):
+    async def test_format_correction_within_loop(self):
         self.client.normal_responses = [response("   "), completion("已修正")]
-        self.assertEqual(self.agent.ask("测试"), "已修正")
+        self.assertEqual((await self.agent.ask("测试")), "已修正")
         self.assertIn("格式无效", self.client.requests[1][0][-1]["content"])
         self.assertEqual(self.session.context.build()[-2]["content"], "   ")
         self.assertEqual(self.session.history.load("导游")[-1]["reason"], "completed")
 
-    def test_failed_correction_and_step_limit(self):
+    async def test_failed_correction_and_step_limit(self):
         for limit, reason, error in ((30, "error", ValueError), (1, "max_steps", RuntimeError)):
             with self.subTest(limit=limit), patch.object(Phase2Store, "record_usage") as usage:
                 self.agent.max_steps = limit
                 self.client.normal_responses = [response("bad"), response("[]")]
                 with self.assertRaises(error):
-                    self.agent.ask("测试")
+                    await self.agent.ask("测试")
                 usage.assert_not_called()
                 self.assertEqual(self.session.history.load("导游")[-1]["reason"], reason)
 
-    def test_incomplete_responses_and_failed_batches(self):
+    async def test_incomplete_responses_and_failed_batches(self):
         calls = [tool_call("a", "read_memory", session_id="A"), tool_call("b", "unknown")]
         for reason, batch in [("length", []), ("content_filter", []), ("tool_calls", []),
                               ("length", calls), ("stop", calls), ("tool_calls", list(reversed(calls)))]:
@@ -197,7 +198,7 @@ class MemoryUsageTests(unittest.TestCase):
                 self.client.normal_responses = [response('{"answer":"忽略","used_session_ids":["A"]}',
                                                         calls=batch, finish=reason)]
                 with self.assertRaises((RuntimeError, KeyError)):
-                    self.agent.ask("测试")
+                    await self.agent.ask("测试")
                 events = self.session.history.load("导游")
                 self.assertEqual(events[-1]["reason"], "error")
                 results = [e["message"] for e in events if e["turn"] == self.session.turn
@@ -206,14 +207,14 @@ class MemoryUsageTests(unittest.TestCase):
                 self.assertTrue(all("error" in json.loads(m["content"]) for m in results))
                 usage.assert_not_called()
 
-    def test_usage_failure_after_commit_is_only_a_warning(self):
+    async def test_usage_failure_after_commit_is_only_a_warning(self):
         self.client.normal_responses = [completion("已保存", "A")]
         with patch.object(Phase2Store, "record_usage", side_effect=sqlite3.OperationalError("locked")), \
                 self.assertLogs("agent", level="WARNING"):
-            self.assertEqual(self.agent.ask("测试"), "已保存")
+            self.assertEqual((await self.agent.ask("测试")), "已保存")
         self.assertEqual(self.session.history.load("导游")[-1]["reason"], "completed")
 
-    def test_failed_turn_end_propagates_before_usage(self):
+    async def test_failed_turn_end_propagates_before_usage(self):
         append = self.session.append_history
 
         def fail_end(events):
@@ -224,16 +225,17 @@ class MemoryUsageTests(unittest.TestCase):
         self.client.normal_responses = [completion("完成", "A")]
         with patch.object(self.session, "append_history", side_effect=fail_end), \
                 patch.object(Phase2Store, "record_usage") as usage:
-            with self.assertRaises(OSError):
-                self.agent.ask("测试")
+            with self.assertRaises(SessionIntegrityError) as caught:
+                await self.agent.ask("测试")
+            self.assertIsInstance(caught.exception.__cause__, OSError)
             usage.assert_not_called()
 
-    def test_max_steps_after_real_retrieval(self):
+    async def test_max_steps_after_real_retrieval(self):
         self.seed()
         self.agent.max_steps = 1
         self.client.normal_responses = [step(tool_call("lookup", "read_memory", session_id="A"))]
         with self.assertRaisesRegex(RuntimeError, "最大 LLM 请求次数"):
-            self.agent.ask("查询")
+            await self.agent.ask("查询")
         self.assertEqual(self.session.history.load("导游")[-1]["reason"], "max_steps")
         self.assertEqual(self.usage(), (0, None))
 
@@ -255,10 +257,10 @@ class MemoryUsageTests(unittest.TestCase):
         for sid in (None, "", "blank", "disabled", "missing"):
             self.assertIn("error", self.executor.call_tool("read_memory", {"session_id": sid}))
 
-    def test_full_request_budget_includes_snapshot_and_output(self):
+    async def test_full_request_budget_includes_snapshot_and_output(self):
         self.path.write_text("快照" * 3000)
         self.client.normal_responses = [completion("完成")]
-        self.agent.ask("预算")
+        await self.agent.ask("预算")
         messages, tools, options = self.client.requests[0]
         self.assertIn("tokens truncated…", messages[0]["content"])
         total = self.session.tokens.count_request(messages, tools, response_format=options["response_format"]) + options["max_tokens"]
@@ -266,7 +268,7 @@ class MemoryUsageTests(unittest.TestCase):
         second.compact.context_window = total - 1
         agent = GuideAgent(self.client, ToolExecutor(include_amap=False), second)
         with self.assertRaisesRegex(RuntimeError, "输入预算"):
-            agent.ask("预算")
+            await agent.ask("预算")
         self.assertEqual(len(self.client.requests), 1)
         self.assertEqual(second.history.load("导游")[-1]["reason"], "error")
 
@@ -332,7 +334,7 @@ class MemoryUsageTests(unittest.TestCase):
             conn.execute("DELETE FROM sessions WHERE session_id='orphan'")
         self.assertFalse(search_memory(["杭州"])["results"])
 
-    def test_search_error_can_be_corrected_in_the_same_turn(self):
+    async def test_search_error_can_be_corrected_in_the_same_turn(self):
         self.seed()
         self.assertEqual(self.agent.max_steps, 30)
         self.client.normal_responses = [
@@ -340,7 +342,7 @@ class MemoryUsageTests(unittest.TestCase):
             step(tool_call("good", "search_memory", queries=["杭州"])),
             completion("乘公交", "A"),
         ]
-        self.assertEqual(self.agent.ask("之前的偏好？"), "乘公交")
+        self.assertEqual((await self.agent.ask("之前的偏好？")), "乘公交")
         self.assertIn("error", json.loads(self.client.requests[1][0][-1]["content"]))
         result = json.loads(self.client.requests[2][0][-1]["content"])
         self.assertEqual(result["results"][0]["session_id"], "A")
@@ -362,11 +364,11 @@ class MemoryUsageTests(unittest.TestCase):
             self.assertIn("HANG-ZHOU", match["content"])
             self.assertLessEqual(len(match["content"]), MAX_CONTENT)
 
-    def test_usage_survives_phase1_and_ranks_phase2(self):
+    async def test_usage_survives_phase1_and_ranks_phase2(self):
         self.seed("A")
         self.seed("Z")
         self.client.normal_responses = [completion("完成", "Z")]
-        self.agent.ask("沿用此前决定")
+        await self.agent.ask("沿用此前决定")
         store = Stage1Store()
         store.record_turn_end("Z", 11, int(time.time()))
         claim = store.claim_stage1(scan_limit=20, max_running=1, max_age_days=1, min_idle_seconds=0,
@@ -377,13 +379,14 @@ class MemoryUsageTests(unittest.TestCase):
         claim2 = Phase2Store().claim(limit=1, active_days=1, interval=60, max_retries=1)
         self.assertEqual([(m.session_id, m.source_seq) for m in claim2.memories], [("Z", 11)])
 
-    def test_memory_pipeline_keeps_its_own_response_contracts(self):
+    async def test_memory_pipeline_keeps_its_own_response_contracts(self):
         self.client.normal_responses = [completion("乘坐公交"), response('{"action":"replace","summary":"偏好公交"}')]
         self.client.summary_response = response('{"rollout_summary":"偏好公交","rollout_slug":"travel"}')
-        self.agent.ask("我偏好公交。")
+        await self.agent.ask("我偏好公交。")
         with closing(get_connection()) as conn, conn:
             conn.execute("UPDATE sessions SET updated_at = ?", (int(time.time()) - 86400,))
-        self.assertEqual(MemoryManager(self.client).run(), "updated")
+        with patch.object(self.client, "ask", FakeClient.ask.__get__(self.client)):
+            self.assertEqual(MemoryManager(self.client).run(), "updated")
         self.assertEqual(self.path.read_text().strip(), "偏好公交")
         _, phase1, phase2 = self.client.requests
         self.assertIsNone(phase1[1])

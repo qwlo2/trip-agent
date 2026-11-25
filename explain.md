@@ -15,6 +15,21 @@ context-build
 memmory
 
 
+架构调整：
+    
+    从单线程的cil逐步转变为通过fastapi的web服务
+    
+    任务调度：
+    架构采用单线程+协程调度（后续加入工作线程池），类似于单event-loop
+    通过asyncio封装的event-loop，listen-fd和io事件在同一次epoll就绪事件中
+    由semaphore控制并发数量（不同于条件变量会自动释放锁，这里不会自动增加值，由于是单线程不用加锁）
+    也就是相当于有2个任务队列，epoll的就绪队列，循环处理task的时候，会不断获取semaphore，
+    当不足时加入semaphore的等待队列，而获取的task会并发处理，当挂起时会直接放入epoll的等待队列
+     因此epoll会不断接受新fd并加入semaphore的等待队列，同时获取value的task会在epoll中进行处理，当
+     完成就释放value
+
+    新增了RuntimeManager
+
 1.1、session
 Chat Completions API,会话对于llm是不存在的，它只是单纯根据上下文进行推理，session是在agent中
 

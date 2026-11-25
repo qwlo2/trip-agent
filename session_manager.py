@@ -1,11 +1,12 @@
 """用 SQLite 管理会话目录，为每个会话加载独立的事件日志和上下文。"""
 
+import sqlite3
 import time
 from contextlib import closing
 from typing import Any
 from uuid import uuid4
 
-from client import Trip_Client
+from client import AsyncTripClient
 from compact import Compact
 from context_builder import ContextBuilder
 from data_paths import get_data_paths
@@ -18,12 +19,16 @@ from session import Session
 SESSION_PAGE_SIZE = 25
 
 
+class SessionNotFound(KeyError):
+    """目录中没有请求的 Session。"""
+
+
 class SessionManager:
-    """创建、打开、列出、归档和删除会话，缓存最近一次列表的日志路径。"""
+    """创建、打开、列出、归档和删除会话。"""
 
     def __init__(
         self,
-        client: Trip_Client,
+        client: AsyncTripClient | None,
         system_prompt: str,
         compact_settings: dict[str, Any],
     ) -> None:
@@ -37,55 +42,47 @@ class SessionManager:
         self.client = client
         self.system_prompt = system_prompt
         self.compact_settings = dict(compact_settings)
-        self.cache: dict[str, str] = {}
-        self.current_session: Session | None = None
+
+    def select(self, session_id: str) -> str:
+        """只记录用户选择，不重新创建日志写入者。"""
+        with closing(get_connection()) as conn, conn:
+            if not conn.execute("UPDATE sessions SET usage=usage+1 WHERE session_id=?", (session_id,)).rowcount:
+                raise SessionNotFound(f"会话不存在：{session_id}")
+        return session_id
 
     def open(self, session_id: str) -> Session:
-        """重放日志，补齐已完成轮次的记忆记录，再增加 usage。
+        """供独立调用方打开会话；Runtime 加载使用 load()。"""
+        session = self.load(session_id)
+        self.select(session_id)
+        return session
 
-        ID 不存在时抛出 KeyError；日志丢失时抛出 FileNotFoundError。
-        归档会话仍可通过明确的 ID 打开，归档标记保持不变。
-        """
+    def load(self, session_id: str) -> Session:
+        """在事务外重放及验证，随后用短事务检查并补录完整 Turn 水位。"""
+        with closing(get_connection()) as conn:
+            row = conn.execute("SELECT event_log_path FROM sessions WHERE session_id=?", (session_id,)).fetchone()
+        if row is None:
+            raise SessionNotFound(f"会话不存在：{session_id}")
+        path = self.paths.resolve_event_log(session_id, row["event_log_path"])
+        if not path.is_file():
+            raise FileNotFoundError(path)
+        session = Session(HistoryStore(path), ContextBuilder(), self.system_prompt,
+                          Compact(self.client, **self.compact_settings), session_id=session_id)
         with closing(get_connection()) as conn, conn:
             conn.execute("BEGIN IMMEDIATE")
-            row = conn.execute(
-                "SELECT event_log_path FROM sessions WHERE session_id = ?",
-                (session_id,),
-            ).fetchone()
-            if row is None:
-                raise KeyError(f"会话不存在：{session_id}")
-            path = self.paths.resolve_event_log(session_id, row["event_log_path"])
-            if not path.is_file():
-                raise FileNotFoundError(path)
-            session = Session(
-                HistoryStore(path),
-                ContextBuilder(),
-                self.system_prompt,
-                Compact(self.client, **self.compact_settings),
-                session_id=session_id,
-            )
-            log_updated_at = int(path.stat().st_mtime)
-            if session.last_completed_seq is not None:
-                # 日志不含结束时间，补录时用文件修改时间估算。
-                Stage1Store().record_turn_end(
-                    session_id,
-                    session.last_completed_seq,
-                    log_updated_at,
-                    connection=conn,
-                )
-            conn.execute(
-                """
-                UPDATE sessions
-                SET usage = usage + 1, updated_at = MAX(COALESCE(updated_at, created_at), ?)
-                WHERE session_id = ?
-                """,
-                (log_updated_at, session_id),
-            )
-        self.current_session = session
+            row = conn.execute("SELECT last_completed_seq FROM stage1_outputs WHERE session_id=?",
+                               (session_id,)).fetchone()
+            watermark = row[0] if row else None
+            if watermark is not None:
+                event = session.history.get(watermark)
+                if event["type"] != "turn/end" or event.get("reason") != "completed":
+                    raise ValueError("SQLite 水位未对应日志的 completed 事件")
+            latest = session.last_completed_seq
+            if latest is not None and latest != watermark:
+                Stage1Store().record_turn_end(session_id, latest, int(path.stat().st_mtime), connection=conn)
         return session
 
     def get_sessions(self, limit: int = SESSION_PAGE_SIZE, offset: int = 0) -> list[dict[str, Any]]:
-        """按使用次数降序返回未归档会话，并将本页路径保存为 ID 到路径的字典。
+        """按使用次数降序返回未归档会话。
 
         每页默认 25 条，参考 Codex 会话选择器；offset 用于获取后续页。
         使用次数相同时优先显示新建会话，再按 ID 排序以保持顺序稳定。
@@ -103,9 +100,7 @@ class SessionManager:
                 """,
                 (limit, offset),
             ).fetchall()
-        sessions = [dict(row) for row in rows]
-        self.cache = {row["session_id"]: row["event_log_path"] for row in sessions}
-        return sessions
+        return [dict(row) for row in rows]
 
     def archived(self, session_id: str, is_archived: bool = True) -> bool:
         """设置归档标记，传入 False 可恢复展示；返回标记是否实际改变。"""
@@ -117,16 +112,16 @@ class SessionManager:
                 """,
                 (is_archived, session_id, is_archived),
             )
-        self.cache.pop(session_id, None)
         return cursor.rowcount == 1
 
     def delete(self, session_id: str) -> bool:
         """删除日志、会话、局部记忆和对应 Phase 1 任务，返回是否找到会话。
 
         已进入全局记忆的内容留待下一次 Phase 2 筛选淘汰；相关输入版本会推进。
-        日志删除失败时异常直接传播，数据库事务回滚。
+        目录提交成功后才移除日志，清理失败单独报告。
         """
-        with closing(get_connection()) as conn, conn:
+        commit_error = None
+        with closing(get_connection()) as conn:
             conn.execute("BEGIN IMMEDIATE")
             row = conn.execute(
                 """
@@ -148,33 +143,46 @@ class SessionManager:
             conn.execute("DELETE FROM sessions WHERE session_id = ?", (session_id,))
             if row["allow_global"] and row["rollout_summary"]:
                 conn.execute(_ADVANCE_PHASE2_SQL, (int(time.time()),))
+            try:
+                conn.commit()
+            except sqlite3.Error as exc:
+                commit_error = exc
+        if commit_error is not None:
+            with closing(get_connection()) as conn:
+                exists = conn.execute("SELECT 1 FROM sessions WHERE session_id=?", (session_id,)).fetchone()
+            if exists:
+                raise commit_error
+        try:
             path.unlink(missing_ok=True)
-        self.cache.pop(session_id, None)
-        if self.current_session is not None and self.current_session.session_id == session_id:
-            self.current_session = None
+        except OSError as exc:
+            raise OSError(f"数据库已删除会话，日志清理失败：{path}") from exc
         return True
 
-    def create(self, name: str) -> Session:
-        """生成 UUID，在 sessions 和 stage1_outputs 中建档，再打开新会话。
-
-        日志保存在会话目录下的 events.jsonl，首次打开写入系统消息。
-        新会话打开成功后的 usage 为 1。
-        """
+    def create_id(self, name: str) -> str:
+        """先建立独有的日志，再发布目录记录；提交不确定时保留已有记录的文件。"""
         name = name.strip()
         if not name:
             raise ValueError("会话名称不能为空")
         session_id = str(uuid4())
         path = self.paths.event_log(session_id)
-        log_path = path.relative_to(self.paths.root).as_posix()
-        with closing(get_connection()) as conn, conn:
-            conn.execute(
-                """
-                INSERT INTO sessions (session_id, event_log_path, name, created_at)
-                VALUES (?, ?, ?, ?)
-                """,
-                (session_id, log_path, name, int(time.time())),
-            )
-            conn.execute("INSERT INTO stage1_outputs (session_id) VALUES (?)", (session_id,))
-            path.parent.mkdir()
-            path.touch(exist_ok=False)
-        return self.open(session_id)
+        path.parent.mkdir()
+        try:
+            HistoryStore(path).load(self.system_prompt)
+            with closing(get_connection()) as conn, conn:
+                conn.execute(
+                    "INSERT INTO sessions(session_id,event_log_path,name,created_at,usage) VALUES (?,?,?,?,1)",
+                    (session_id, path.relative_to(self.paths.root).as_posix(), name, int(time.time())),
+                )
+                conn.execute("INSERT INTO stage1_outputs(session_id) VALUES (?)", (session_id,))
+        except Exception:
+            with closing(get_connection()) as conn:
+                exists = conn.execute("SELECT 1 FROM sessions WHERE session_id=?", (session_id,)).fetchone()
+            if not exists:
+                path.unlink(missing_ok=True)
+                path.parent.rmdir()
+            raise
+        return session_id
+
+    def create(self, name: str) -> Session:
+        """为独立调用方返回已打开的新会话。"""
+        return self.load(self.create_id(name))
