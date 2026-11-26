@@ -67,11 +67,16 @@ class GuideAgent:
         self.executor = executor
         self.session = session
         self.max_steps = max_steps
+
+        async def compact_context():
+            """使用会话默认行为执行模型发起的压缩。"""
+            return await session.compact_now()
+
         executor.register_tool(
             name="compact_context",
             description="用户要求压缩上下文时调用。生成历史摘要并持久化，保留近期消息和当前工具调用，返回实际压缩状态。",
             parameters={"type": "object", "properties": {}, "additionalProperties": False},
-            handler=session.compact_now, mode=ToolExecutionMode.ASYNC,
+            handler=compact_context, mode=ToolExecutionMode.ASYNC,
         )
         register_memory_tools(executor)
         session.tools_provider = executor.get_all_tools

@@ -5,7 +5,7 @@ import tempfile
 import unittest
 from copy import deepcopy
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from openai.types.chat import ChatCompletion
 
@@ -327,8 +327,8 @@ class CompactTests(unittest.IsolatedAsyncioTestCase):
         self.assertIs(cache, self.compact.ensure_balance_cache(self.session))
         self.assertEqual(cache.in_progress_tool_calls, 1)
 
-    async def test_manual_tool_directly_calls_compact_now(self):
-        """LLM 工具直接执行公共压缩函数，未完成的整组调用保留在尾部。"""
+    async def test_manual_tool_compacts_and_preserves_pending_calls(self):
+        """LLM 工具提交摘要，并在尾部保留尚未完成的整批调用。"""
         self.populate()
         compact = Compact(
             self.client, context_window=10000, max_output_tokens=200,
@@ -344,7 +344,6 @@ class CompactTests(unittest.IsolatedAsyncioTestCase):
         observed_pending = []
         self.client.on_summary = lambda: observed_pending.append(compact.ensure_balance_cache(self.session).in_progress_tool_calls)
         agent = GuideAgent(self.client, executor, self.session)
-        self.assertEqual(executor._tools["compact_context"][1], self.session.compact_now)
         self.assertEqual((await agent.ask("请压缩上下文")), "完成")
         self.assertEqual(observed_pending, [2])
         records = [json.loads(line) for line in self.path.read_text().splitlines()]
@@ -354,6 +353,35 @@ class CompactTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(json.loads(results[0]["message"]["content"])["status"], "compacted")
         self.assertEqual(summary["data"]["source"], "manual")
         self.assertEqual(compact.ensure_balance_cache(self.session).in_progress_tool_calls, 0)
+        self.assertEqual(self.reopen().context.nodes(), self.session.context.nodes())
+
+    async def test_compact_tool_rejects_internal_arguments_and_pairs_results(self):
+        """模型传入内部参数时拒绝压缩，并为整批调用写入对应结果。"""
+        self.session.compact = Compact(
+            self.client, context_window=10000, max_output_tokens=200,
+            threshold_ratio=0.9, retain_ratio=0.01,
+        )
+        self.populate()
+        executor = ToolExecutor(include_amap=False)
+        echo = Mock(return_value="ok")
+        executor.register_tool("echo", "测试", {"type": "object", "properties": {}}, echo)
+        agent = GuideAgent(self.client, executor, self.session)
+        for name, value in (("standalone", True), ("source", "auto")):
+            with self.subTest(argument=name):
+                calls = [tool_call(name, "compact_context", **{name: value}), tool_call(f"after-{name}")]
+                self.client.normal_responses = [response(None, calls=calls, finish="tool_calls"), completion("完成")]
+                with self.assertRaisesRegex(TypeError, name):
+                    await agent.ask("请压缩上下文")
+
+                events = self.session.history.turn_events(self.session.turn)
+                results = [event["message"] for event in events if event.get("message", {}).get("role") == "tool"]
+                self.assertEqual([result["tool_call_id"] for result in results], [call["id"] for call in calls])
+                self.assertIn(name, json.loads(results[0]["content"])["error"])
+                self.assertIn("error", json.loads(results[1]["content"]))
+                self.assertEqual(events[-1]["reason"], "error")
+                self.assertFalse(any(event["type"] == "compaction/summary" for event in events))
+        echo.assert_not_called()
+        self.assertTrue(all(tools is not None for _, tools, _ in self.client.requests))
         self.assertEqual(self.reopen().context.nodes(), self.session.context.nodes())
 
     async def test_agent_auto_compacts_before_request(self):
