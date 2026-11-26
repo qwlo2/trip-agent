@@ -28,7 +28,30 @@ memmory
      因此epoll会不断接受新fd并加入semaphore的等待队列，同时获取value的task会在epoll中进行处理，当
      完成就释放value
 
-    新增了RuntimeManager
+    新增了RuntimeManager,SessionManager管理会话的职责删去，只负责持久化
+
+    任务流转如下：
+        listenfd接受fd，然后通过RuntimeManager获取session
+        （它维持有session-id->GuideAgent ，每个GuideAgent的ageng可以改变，有独立的tool，后续可以做成多agent，同时也封装了task，多个task可以对应同一个session，但是独占写session）
+        随后获取semaphore，也就是要么进行并发，完成后返回，否则进入epoll的等待队列；要么进入semaphore的等待队列，循环往复
+        上下文构建：
+                  通过重放event-log以及替换摘要，获取完整上下文，之后将新对话加入
+                  随后将全局记忆注入，当超过限制时，只截取开头和结尾 ，并不强制要求检索记忆
+                  采用Agentic检索，将记忆检索作为工具提供给LLM，LLM决定是否检索
+                  只在最终回答让LLM返回调用记忆id并更新usage
+        记忆提取：（参考codex的memory-pipiline）
+                 触发条件为重启并空闲6小时，采取2阶段
+                 phase1：
+                    筛选触发条件：
+                        活动时间必须在10天内，必须空闲6小时，只提取使用次数最多的2个session，额度在25%
+                 由sqlite存储
+
+                 phase2：
+                    从局部记忆中进行筛选
+                        条件：
+                         phare2:提取256条局部，必须在30天内活跃，每次全局的提取间隔6小时，数据库只能重试3次
+                    随后分别创建256个md文件存放局部记忆，提供git得到增删改，将其和旧全局记忆给LLM来决定是否更新
+        
 
 1.1、session
 Chat Completions API,会话对于llm是不存在的，它只是单纯根据上下文进行推理，session是在agent中
@@ -153,6 +176,14 @@ B：安全预留，同样设置为当前模型支持的最大输出 Token。
     全局记忆-md
     store_database（提供数据库的初始化和连接，以及对外接口）
 
+触发条件：
+    参考codex的方案，采取parse1.2的方式
+    codex的触发要求重新启动后必须开启新对话才开始phase1，提取记忆
+    项目删去必须开启新对话的要求，当重新启动后，从sqlite中筛选符合条件的局部记忆
+    条件：
+    phare1：活动时间必须在10天内，必须空闲6小时，只提取使用次数最多的2个session，额度在25%
+    phare2:提取256条局部，必须在30天内活跃，每次全局的提取间隔6小时，数据库只能重试3次
+
 phase1：
       会从event-log中筛选seq，从文件末尾反向扫描，筛选按事件类型先分优先级，
       事件优先级如下（从高到底）：
@@ -203,13 +234,6 @@ phase1：
 接下来加入，在llm提取记忆时返回引用得seeeion-id，并在sqlite中更新
 llm如何提取记忆
 
-触发条件：
-    参考codex的方案，采取parse1.2的方式
-    codex的触发要求重新启动后必须开启新对话才开始phase1，提取记忆
-    项目删去必须开启新对话的要求，当重新启动后，从sqlite中筛选符合条件的局部记忆
-    条件：
-    phare1：活动时间必须在10天内，必须空闲6小时，只提取使用次数最多的2个session，额度在25%
-    phare2:提取256条局部，必须在30天内活跃，每次全局的提取间隔6小时，数据库只能重试3次
 
 Agent 运行中
     │

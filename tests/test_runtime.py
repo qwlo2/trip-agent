@@ -19,7 +19,7 @@ from history import HistoryStore
 from memory.phase1.event_reader import EventReader
 from runtime.manager import RuntimeManager, RuntimeState
 from session import Session, SessionIntegrityError
-from session_manager import SessionManager
+from session_repository import SessionRepository
 from test_compact import completion, response, tool_call
 from tool_executor import ToolExecutionMode, ToolExecutor
 
@@ -33,9 +33,9 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.addCleanup(env.stop)
         get_data_paths.cache_clear()
         self.addCleanup(get_data_paths.cache_clear)
-        self.directory = SessionManager(None, "导游", dict(context_window=32000, max_output_tokens=500,
+        self.directory = SessionRepository("导游", dict(context_window=32000, max_output_tokens=500,
                                                         threshold_ratio=.8, retain_ratio=.02))
-        self.a, self.b = (self.directory.create_id(key) for key in ("A", "B"))
+        self.a, self.b = (self.directory.create(key) for key in ("A", "B"))
         self.client = AsyncMock()
         self.client.model = "test"
         self.client.ask.return_value = completion("完成")
@@ -186,7 +186,7 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
             release.set()
             self.assertEqual((await self.wait_task(a))["status"], "failed")
             self.assertEqual((await self.wait_task(b))["status"], "completed")
-        self.directory.load(self.a)
+        self.directory.load(self.a, self.client)
 
     async def test_cancel_during_completed_commit_and_usage(self):
         rt = await self.setup_runtime()
@@ -225,7 +225,7 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
         rt = await self.setup_runtime(max_concurrent_tasks=1)
         entered, release = threading.Event(), self.gate(True)
         started, allow = asyncio.Event(), self.gate()
-        create = self.directory.create_id
+        create = self.directory.create
 
         def held_create(name):
             entered.set()
@@ -238,7 +238,7 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
             raise ValueError("offline")
 
         self.client.ask.side_effect = held_ask
-        with patch.object(self.directory, "create_id", held_create):
+        with patch.object(self.directory, "create", held_create):
             management = asyncio.create_task(rt.create_session("new"))
             self.assertTrue(await asyncio.to_thread(entered.wait, 5))
             a = rt.submit(self.a, "A")
@@ -332,13 +332,13 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
             with closing(get_connection()) as conn, conn:
                 conn.execute("UPDATE stage1_outputs SET last_completed_seq=? WHERE session_id=?", (value, self.a))
             if value is None or value == end:
-                self.assertEqual(self.directory.load(self.a).last_completed_seq, end)
+                self.assertEqual(self.directory.load(self.a, self.client).last_completed_seq, end)
                 with closing(get_connection()) as conn:
                     self.assertEqual(conn.execute("SELECT last_completed_seq FROM stage1_outputs WHERE session_id=?",
                                                   (self.a,)).fetchone()[0], end)
             else:
-                with self.assertRaises(ValueError):
-                    self.directory.load(self.a)
+                with self.assertRaises(SessionIntegrityError):
+                    self.directory.load(self.a, self.client)
         path = get_data_paths().event_log(self.b)
         store = HistoryStore(path)
         store.load("system")
@@ -393,12 +393,12 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
             rt.submit(self.a, "foreign")
         with self.assertRaisesRegex(RuntimeError, "Event Loop"):
             await asyncio.to_thread(asyncio.run, foreign())
-        broken = RuntimeManager(self.directory, client_factory=lambda: self.client)
-        with patch.object(type(self.directory), "client", create=True, new_callable=unittest.mock.PropertyMock,
-                          side_effect=RuntimeError("startup")), self.assertRaisesRegex(RuntimeError, "startup"):
+        broken = RuntimeManager(self.directory, client_factory=unittest.mock.Mock(side_effect=RuntimeError("startup")))
+        with self.assertRaisesRegex(RuntimeError, "startup"):
             await broken.start()
         self.assertEqual(broken.state, RuntimeState.CLOSED)
-        self.client.close.assert_awaited_once()
+        self.assertFalse(hasattr(self.directory, "client"))
+        self.client.close.assert_not_awaited()
 
     async def test_initialization_exclusive_and_failed_start_never_publishes(self):
         rt = await self.setup_runtime()
@@ -420,7 +420,7 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
             release.set()
             self.assertIn("initialize", (await self.wait_task(key))["error"])
             self.assertNotIn(self.a, rt._sessions)
-            loads.assert_called_once_with(self.a)
+            loads.assert_called_once_with(self.a, self.client)
         self.assertEqual((await self.wait_task(rt.submit_compact(self.a)))["status"], "completed")
 
     async def test_startup_memory_finishes_before_frontend(self):
@@ -462,7 +462,7 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
             sid = await rt.create_session(name)
             if name == "load":
                 load = self.directory.load
-                injection = patch.object(self.directory, "load", side_effect=lambda s: held(load, s) if s == sid else load(s))
+                injection = patch.object(self.directory, "load", side_effect=lambda s, client: held(load, s, client) if s == sid else load(s, client))
             elif name == "context":
                 build = GuideAgent._request_messages
                 injection = patch.object(GuideAgent, "_request_messages",
@@ -581,4 +581,170 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([e["message"]["tool_call_id"] for e in events if e.get("message", {}).get("role") == "tool"],
                          ["A", "B"])
         self.assertEqual(events[-1]["reason"], "error")
-        self.directory.load(self.a)
+        self.directory.load(self.a, self.client)
+
+    async def test_load_lock_can_be_retried_and_activity_is_reconciled(self):
+        rt = await self.setup_runtime()
+        def immediate_connection():
+            conn = get_connection()
+            conn.execute("PRAGMA busy_timeout=0")
+            return conn
+
+        with closing(get_connection()) as holder, patch("session_repository.get_connection", immediate_connection):
+            holder.execute("BEGIN IMMEDIATE")
+            result = await self.wait_task(rt.submit_compact(self.a))
+            self.assertIn("locked", result["error"])
+        path = get_data_paths().event_log(self.a)
+        stamp = int(path.stat().st_mtime) + 5
+        os.utime(path, (stamp, stamp))
+        self.assertEqual((await self.wait_task(rt.submit_compact(self.a)))["status"], "completed")
+        await self.wait_task(rt.submit_compact(self.a))
+        await rt.select_session(self.a)
+        with closing(get_connection()) as conn:
+            row = conn.execute("SELECT updated_at,usage FROM sessions WHERE session_id=?", (self.a,)).fetchone()
+        self.assertEqual(tuple(row), (stamp, 2))
+
+    async def test_repair_failure_quarantines_even_after_file_was_truncated(self):
+        rt = await self.setup_runtime()
+        path = get_data_paths().event_log(self.a)
+        with path.open("ab") as target:
+            target.write(b'{"seq":')
+        with patch("history.os.fsync", side_effect=OSError("repair")):
+            self.assertIn("repair", (await self.wait_task(rt.submit_compact(self.a)))["error"])
+        with self.assertRaises(SessionIntegrityError):
+            rt.submit_compact(self.a)
+        self.assertTrue(await rt.archive_session(self.a))
+        self.assertTrue(await rt.delete_session(self.a))
+        self.assertIn("SessionNotFound", (await self.wait_task(rt.submit_compact(self.a)))["error"])
+
+    async def test_failed_session_survives_rollback_but_confirmed_delete_retires_writer(self):
+        rt = await self.setup_runtime()
+        await self.wait_task(rt.submit_compact(self.a))
+        old = rt._sessions[self.a].session
+        with patch.object(old.context, "append", side_effect=ValueError("projection")):
+            self.assertIn("projection", (await self.wait_task(rt.submit(self.a, "A")))["error"])
+        self.assertTrue(await rt.archive_session(self.a))
+        with closing(get_connection()) as conn, conn:
+            conn.execute("CREATE TRIGGER deny BEFORE DELETE ON sessions BEGIN SELECT RAISE(ABORT,'deny'); END")
+        with self.assertRaises(sqlite3.Error):
+            await rt.delete_session(self.a)
+        with self.assertRaisesRegex(SessionIntegrityError, "projection"):
+            rt.submit_compact(self.a)
+        with closing(get_connection()) as conn, conn:
+            conn.execute("DROP TRIGGER deny")
+        with patch.object(Path, "unlink", side_effect=OSError("busy")), self.assertRaisesRegex(OSError, "日志清理失败"):
+            await rt.delete_session(self.a)
+        with self.assertRaisesRegex(SessionIntegrityError, "目录已删除"):
+            old.commit_event({"type": "turn/start", "turn": 2})
+        self.assertIn("SessionNotFound", (await self.wait_task(rt.submit_compact(self.a)))["error"])
+
+    async def test_cancel_at_compact_commit_distinguishes_task_from_tool(self):
+        rt = await self.setup_runtime(max_concurrent_tasks=1)
+        for sid in (self.a, self.b):
+            await self.wait_task(rt.submit(sid, "历史" * 2000))
+            await self.wait_task(rt.submit(sid, "历史" * 1000))
+        for sid in (self.a, self.b):
+            compact = rt._sessions[sid].session.compact
+            commit = compact.commit_compaction
+            entered, release = threading.Event(), self.gate(True)
+            def held(*args):
+                result = commit(*args)
+                entered.set()
+                self.assertTrue(release.wait(4))
+                return result
+            self.client.ask.side_effect = [response("摘要")] if sid == self.a else [
+                response(None, calls=[tool_call("compact", "compact_context")], finish="tool_calls"), response("摘要"),
+            ]
+            with patch.object(compact, "commit_compaction", held):
+                key = rt.submit_compact(sid) if sid == self.a else rt.submit(sid, "请压缩")
+                self.assertTrue(await asyncio.to_thread(entered.wait, 4))
+                rt._tasks[key].task.cancel()
+                with self.assertRaises(RuntimeError):
+                    rt.submit_compact(sid)
+                release.set()
+                result = await self.wait_task(key)
+            if sid == self.a:
+                self.assertEqual(result["result"].summary_seq, self.events(sid)[-1]["seq"])
+                self.assertEqual(result["status"], "completed")
+            else:
+                self.assertIn("CancelledError", result["error"])
+                self.assertEqual(self.events(sid)[-1]["reason"], "error")
+                self.directory.load(sid, self.client)
+
+    async def test_direct_drain_cancel_preserves_completion_and_owner(self):
+        rt = await self.setup_runtime()
+        entered, release = asyncio.Event(), self.gate()
+        async def ask(*args, **kwargs):
+            entered.set()
+            await asyncio.wait_for(release.wait(), 4)
+            return completion("已提交")
+        self.client.ask.side_effect = ask
+        key = rt.submit(self.a, "A")
+        await asyncio.wait_for(entered.wait(), 4)
+        draining = asyncio.Event()
+        drain = rt._drain
+        async def observed_drain():
+            draining.set()
+            await drain()
+        with patch.object(rt, "_drain", observed_drain):
+            waiter = asyncio.create_task(rt.shutdown())
+            await asyncio.wait_for(draining.wait(), 4)
+        rt._closing.cancel()
+        await asyncio.sleep(0)
+        self.assertFalse(rt._tasks[key].completion.done())
+        self.assertEqual(rt._owners[self.a], key)
+        release.set()
+        self.assertEqual((await self.wait_task(key))["answer"], "已提交")
+        await asyncio.wait_for(waiter, 4)
+        self.assertNotIn(self.a, rt._owners)
+        self.assertEqual(rt.state, RuntimeState.CLOSED)
+        self.client.close.assert_awaited_once()
+
+    async def test_completed_structured_turn_needs_input_and_answer_in_step(self):
+        rt = await self.setup_runtime()
+        for sid, with_input in ((self.a, False), (self.b, True)):
+            events = [{"turn": 1, "type": "turn/start"}]
+            if with_input:
+                events.append({"turn": 1, "type": "message", "message": {"role": "user", "content": "Q"}})
+            events.append({"turn": 1, "step": 1, "type": "step/start"})
+            answer = {"turn": 1, "type": "message", "message": {"role": "assistant", "content": "A"}}
+            if not with_input:
+                events.append({**answer, "step": 1})
+            events.append({"turn": 1, "step": 1, "type": "step/end"})
+            if with_input:
+                events.append(answer)
+            events.append({"turn": 1, "type": "turn/end", "reason": "completed"})
+            store = HistoryStore(get_data_paths().event_log(sid))
+            store.load("导游")
+            store.append(events)
+            self.assertIn("completed", (await self.wait_task(rt.submit_compact(sid)))["error"])
+            with self.assertRaises(SessionIntegrityError):
+                rt.submit(sid, "Q")
+
+    async def test_unconfirmed_delete_keeps_log_and_blocks_cached_writer(self):
+        rt = await self.setup_runtime()
+        await self.wait_task(rt.submit_compact(self.a))
+        path = get_data_paths().event_log(self.a)
+        class FailedCommit(sqlite3.Connection):
+            def commit(self):
+                raise sqlite3.OperationalError("commit failed")
+        attempts = iter(("transaction", "verify"))
+        def connect():
+            if next(attempts) == "verify":
+                raise sqlite3.OperationalError("verify failed")
+            conn = sqlite3.connect(get_data_paths().database, factory=FailedCommit)
+            conn.row_factory = sqlite3.Row
+            return conn
+        with patch("session_repository.get_connection", connect), self.assertRaisesRegex(SessionIntegrityError, "无法确认"):
+            await rt.delete_session(self.a)
+        self.assertTrue(path.is_file())
+        with self.assertRaisesRegex(SessionIntegrityError, "无法确认"):
+            rt.submit(self.a, "A")
+        self.assertTrue(await rt.delete_session(self.a))
+
+    async def test_replay_program_error_does_not_quarantine_session(self):
+        rt = await self.setup_runtime()
+        with patch.object(Session, "_replay", side_effect=ValueError("implementation fault")):
+            failed = await self.wait_task(rt.submit_compact(self.a))
+        self.assertIn("ValueError: implementation fault", failed["error"])
+        self.assertEqual((await self.wait_task(rt.submit(self.a, "A")))["status"], "completed")

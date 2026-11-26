@@ -18,7 +18,7 @@ from memory.reader import search_memory, truncate_middle_with_token_budget, turn
 from memory.search import MAX_CONTENT, MAX_MATCHES, MAX_OUTPUT_BYTES
 from memory.memory_maneger import MemoryManager
 from session import SessionIntegrityError
-from session_manager import SessionManager
+from session_repository import SessionRepository
 from test_compact import FakeAsyncClient, FakeClient, completion, response, tool_call
 from tool_executor import ToolExecutor
 
@@ -37,10 +37,10 @@ class MemoryUsageTests(unittest.IsolatedAsyncioTestCase):
         get_data_paths.cache_clear()
         self.addCleanup(get_data_paths.cache_clear)
         self.client = FakeAsyncClient()
-        self.manager = SessionManager(self.client, "导游", {
+        self.manager = SessionRepository("导游", {
             "context_window": 32000, "max_output_tokens": 500, "threshold_ratio": .85, "retain_ratio": .1,
         })
-        self.session = self.manager.create("当前会话")
+        self.session = self.manager.load(self.manager.create("当前会话"), self.client)
         self.executor = ToolExecutor(include_amap=False)
         self.agent = GuideAgent(self.client, self.executor, self.session)
         self.path = get_data_paths().memory_summary
@@ -105,7 +105,7 @@ class MemoryUsageTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(results["read"]["summary"], "杭州游览，偏好公交")
         self.assertEqual(results["search2"]["results"][0]["session_id"], "B")
         self.assertEqual(results["read2"]["source_seq"], 10)
-        replay = self.manager.open(self.session.session_id)
+        replay = self.manager.load(self.session.session_id, self.client)
         self.assertEqual(replay.context.nodes(), self.session.context.nodes())
         surface = replay.context.build()
         calls = [call["id"] for m in surface for call in m.get("tool_calls", [])]
@@ -144,10 +144,11 @@ class MemoryUsageTests(unittest.IsolatedAsyncioTestCase):
             {"role": "tool", "tool_call_id": "old", "content": '{"accepted":true}'},
             {"role": "assistant", "content": "旧答案"},
         ]
-        self.session.append_history([{"type": "message", "turn": 1, "message": m} for m in legacy])
-        self.session.append_history([{"type": "turn/end", "turn": 1, "reason": "completed"}])
+        for m in legacy:
+            self.session.commit_event({"type": "message", "turn": 1, "message": m})
+        self.session.commit_event({"type": "turn/end", "turn": 1, "reason": "completed"})
         original = self.session.history.path.read_bytes()
-        reopened = self.manager.open(self.session.session_id)
+        reopened = self.manager.load(self.session.session_id, self.client)
         agent = GuideAgent(self.client, ToolExecutor(include_amap=False), reopened)
         reply = completion("新答案")
         reply.choices[0].message.reasoning_content = "当前回答依据"
@@ -215,7 +216,7 @@ class MemoryUsageTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.session.history.load("导游")[-1]["reason"], "completed")
 
     async def test_failed_turn_end_propagates_before_usage(self):
-        append = self.session.append_history
+        append = self.session.history.append
 
         def fail_end(events):
             if events[0]["type"] == "turn/end":
@@ -223,7 +224,7 @@ class MemoryUsageTests(unittest.IsolatedAsyncioTestCase):
             return append(events)
 
         self.client.normal_responses = [completion("完成", "A")]
-        with patch.object(self.session, "append_history", side_effect=fail_end), \
+        with patch.object(self.session.history, "append", side_effect=fail_end), \
                 patch.object(Phase2Store, "record_usage") as usage:
             with self.assertRaises(SessionIntegrityError) as caught:
                 await self.agent.ask("测试")
@@ -264,7 +265,7 @@ class MemoryUsageTests(unittest.IsolatedAsyncioTestCase):
         messages, tools, options = self.client.requests[0]
         self.assertIn("tokens truncated…", messages[0]["content"])
         total = self.session.tokens.count_request(messages, tools, response_format=options["response_format"]) + options["max_tokens"]
-        second = self.manager.create("切换会话")
+        second = self.manager.load(self.manager.create("切换会话"), self.client)
         second.compact.context_window = total - 1
         agent = GuideAgent(self.client, ToolExecutor(include_amap=False), second)
         with self.assertRaisesRegex(RuntimeError, "输入预算"):

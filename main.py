@@ -9,7 +9,7 @@ from typing import Any
 from agent import SYSTEM_PROMPT
 from runtime.manager import RuntimeManager
 from runtime.blocking import blocking, wait_finished
-from session_manager import SESSION_PAGE_SIZE, SessionManager
+from session_repository import SESSION_PAGE_SIZE, SessionRepository
 from settings_loader import convert_settings, load_settings
 
 
@@ -97,11 +97,11 @@ async def select_session(list_sessions, select, create) -> str | None:
 async def main() -> None:
     """CLI 只持有当前 Session ID，提交任务后可继续选择其他会话。"""
     settings = load_compact_settings()
-    directory = await blocking(SessionManager, None, SYSTEM_PROMPT, settings)
+    directory = await blocking(SessionRepository, SYSTEM_PROMPT, settings)
     runtime = RuntimeManager(directory)
     try:
-        session_id = await select_session(partial(blocking, directory.get_sessions),
-                                          partial(blocking, directory.select), partial(blocking, directory.create_id))
+        session_id = await select_session(partial(blocking, directory.list_sessions),
+                                          partial(blocking, directory.record_open), partial(blocking, directory.create))
         if session_id is None:
             return
         await runtime.start(session_id)

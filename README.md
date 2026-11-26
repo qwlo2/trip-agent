@@ -72,13 +72,13 @@ VS Code 的默认 Python 解释器已配置为 `.venv/bin/python`。若仍提示
 | `memories/phase2_workspace_diff.md` | Phase 2 工作区差异 |
 
 `DataPaths.ensure_directories()` 创建公共目录。数据库由 `init_database()` 初始化，
-会话目录由 `SessionManager.create()` 创建。Phase 1 可用
+会话目录由 `SessionRepository.create()` 创建。Phase 1 可用
 `EventReader.for_session(session_id, log_path=...)` 读取会话日志；
 Phase 1 和 Phase 2 的记忆文件位置由 `DataPaths` 提供。
 
 ### 会话管理
 
-`SessionManager` 的字段为 `session_id`、`event_log_path`、`name`、
+`SessionRepository.list_sessions()` 返回的目录字段为 `session_id`、`event_log_path`、`name`、
 `is_archived`、`usage` 和 `created_at`。新记录的 `event_log_path` 相对于数据根目录，
 `created_at` 为 Unix 秒级时间戳。
 
@@ -87,11 +87,11 @@ from agent import SYSTEM_PROMPT
 import asyncio
 from main import load_compact_settings
 from runtime.manager import RuntimeManager
-from session_manager import SessionManager
+from session_repository import SessionRepository
 
 async def run_trip():
-    directory = await asyncio.to_thread(SessionManager, None, SYSTEM_PROMPT, load_compact_settings())
-    session_id = await asyncio.to_thread(directory.create_id, "杭州旅游")
+    directory = await asyncio.to_thread(SessionRepository, SYSTEM_PROMPT, load_compact_settings())
+    session_id = await asyncio.to_thread(directory.create, "杭州旅游")
     runtime = RuntimeManager(directory)
     try:
         await runtime.start(session_id)
@@ -104,7 +104,7 @@ async def run_trip():
 asyncio.run(run_trip())
 ```
 
-`SessionManager` 管理目录。用户选择会话时增加使用次数，Runtime 首次执行任务时独占加载并验证日志。
+`SessionRepository` 管理目录。用户选择会话时增加使用次数，Runtime 首次执行任务时独占加载并验证日志。
 运行期间通过 Runtime 的创建、选择、分页、归档和删除接口访问目录。删除先提交 SQLite，再清理日志。
 命令行从 `sessions` 表列出已登记的会话。
 此前由独立问答入口生成、尚未登记的 `sessions/default/events.jsonl` 或 `history.jsonl`
@@ -153,9 +153,7 @@ asyncio.run(run_trip())
 `HistoryStore`、`ContextBuilder`、`Tokens` 和 `Compact`，加载消息上下文并恢复 token 缓存，
 维护最近的 turn 编号，提供：
 
-- `append_history(events)`：封装 `HistoryStore.append()`，写入事件并更新 turn。
-- `append_context(message, usage=None, seq=...)`：封装 `ContextBuilder.append()`，
-  向内存追加消息并更新 token 缓存；模型响应可传入服务端 usage。
+- `commit_event(event)` 在一次同步提交中持久化事件并更新 SQLite 活动记录。消息事件随后更新 Surface 和 Token 缓存。
 - `get_tools()`：通过当前 `tools_provider` 统一获取工具 Schema。
 - `count_context_tokens(messages=None)`：统计当前或候选上下文及工具 Schema 的成本。
 - `measure_context_tokens(messages=None)`：统计实际上下文并更新 token 缓存。
@@ -166,7 +164,7 @@ asyncio.run(run_trip())
 `ContextBuilder` 使用 `SurfaceNode(seq, message)` 维护当前有效消息，支持
 `append(message, seq)`、`build()`、`nodes()`、`locate_range()`、`replace()` 和 `clear()`。
 公开获取的消息为独立副本，不能绕过 Replace 修改工具配对。
-Agent 先用 `Session.append_history()` 获取实际 seq，再用 `append_context()` 追加消息。
+消息在 Surface 中沿用日志分配的 seq。
 普通 Append 不改变 `replace_generation`；Replace 和清空操作使结构版本递增。
 turn、step 等日志事件不进入模型请求。
 
@@ -343,9 +341,7 @@ MCP 查询失败时，工具返回错误结果给模型；工具发现失败时�
 
 `ask()` 发送一次请求，直接返回 SDK 原始 `ChatCompletion` 响应，不自动解析。
 `GuideAgent.ask()` 先将 `response.choices[0].message.model_dump(exclude_none=True)`
-通过 `Session.append_history()` 和 `Session.append_context()`
-分别追加到文件历史和内存消息列表，
-再调用 `parse_response(response)` 得到 `Message`：
+通过 `Session.commit_event()` 提交到日志和当前上下文，然后根据以下字段处理回答或工具调用。
 
 - `role`：消息角色，LLM 返回的消息通常为 `assistant`。
 - `content`：回复文本，工具调用时可能为空。

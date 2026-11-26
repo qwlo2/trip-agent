@@ -73,7 +73,6 @@ class Compact:
         # 近期消息保留预算 K，初始化后直接供压缩范围选择使用。
         self.retain_tokens = floor((context_window - max_output_tokens) * retain_ratio)
         self.balance_cache: BalanceCache | None = None
-        self.last_result: CompactResult | None = None
 
     @staticmethod
     def event_delta(node: SurfaceNode) -> int:
@@ -118,9 +117,8 @@ class Compact:
         """准备模型请求时计量有效消息及工具 Schema，达到 T 后自动压缩。"""
         count = await blocking(session.measure_context_tokens)
         if count < self.threshold:
-            self.last_result = CompactResult("skipped", "below_threshold", count, count)
-            return self.last_result
-        return await self.compact_now(session, source="auto")
+            return CompactResult("skipped", "below_threshold", count, count)
+        return await self.compact_now(session, source="auto", before=count)
 
     async def summarize(self, selection: CompactRange) -> tuple[str, dict[str, Any] | None]:
         """独立调用 LLM 生成摘要，不提供业务工具，不进入普通 Agent 循环。"""
@@ -137,22 +135,21 @@ class Compact:
         return message.content.strip(), usage
 
     async def compact_now(
-        self, session: Session, *, source: str = "manual",
+        self, session: Session, *, source: str = "manual", before: int | None = None, standalone: bool = False,
     ) -> CompactResult:
         """自动及 LLM 工具调用共用的执行入口，只压缩已闭合的历史前缀。
 
         工具调用过程中保留当前未闭合调用所在的尾部；没有非空安全范围时跳过。
         session 仅作为本次调用参数使用，不保存在 Compact 对象中。
         """
-        before = await blocking(session.measure_context_tokens)
+        if before is None:
+            before = await blocking(session.measure_context_tokens)
         selection = await blocking(self.select_compactable_range, session)
         if selection is None:
-            result = CompactResult("skipped", "no_safe_range", before, before)
-        else:
-            summary, usage = await self.summarize(selection)
-            result = await blocking(self.commit_compaction, session, selection, summary, usage, source)
-        self.last_result = result
-        return result
+            return CompactResult("skipped", "no_safe_range", before, before)
+        summary, usage = await self.summarize(selection)
+        return await blocking(self.commit_compaction, session, selection, summary, usage, source,
+                              finish_on_cancel=standalone)
 
     def commit_compaction(
         self, session: Session, selection: CompactRange, summary: str, usage: dict[str, Any] | None,

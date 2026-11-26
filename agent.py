@@ -171,7 +171,3 @@ class GuideAgent:
             await blocking(self.session.commit_event, {"type": "message", "turn": turn, "step": step, "message": message})
         if error is not None:
             raise error
-
-    def clear_history(self) -> None:
-        """清空独立会话的历史；已登记的会话应创建新会话。"""
-        self.session.clear()

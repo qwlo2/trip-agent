@@ -3,25 +3,18 @@
 import asyncio
 import logging
 from collections import deque
-from dataclasses import dataclass
+from contextlib import contextmanager
 from enum import Enum
 from uuid import uuid4
 
 from agent import GuideAgent
 from client import AsyncTripClient, Trip_Client
 from memory.memory_maneger import MemoryManager
-from runtime.blocking import blocking
+from runtime.blocking import blocking, wait_finished
 from runtime.task import TaskKind, TaskRecord, TaskStatus
-from session import Session, SessionIntegrityError
-from session_manager import SessionManager, SessionNotFound
+from session import SessionIntegrityError
+from session_repository import LogCleanupError, SessionRepository
 from tool_executor import ToolExecutor
-
-
-@dataclass
-class SessionRuntime:
-    session: Session
-    agent: GuideAgent
-    executor: ToolExecutor
 
 
 class RuntimeState(str, Enum):
@@ -38,7 +31,7 @@ def startup_memory(session_id: str) -> None:
 
 
 class RuntimeManager:
-    def __init__(self, directory: SessionManager, *, max_concurrent_tasks: int = 4,
+    def __init__(self, directory: SessionRepository, *, max_concurrent_tasks: int = 4,
                  max_pending_tasks: int = 32, max_completed_tasks: int = 128,
                  client_factory=AsyncTripClient, executor_factory=ToolExecutor):
         if any(type(n) is not int or n < 1 for n in (max_concurrent_tasks, max_pending_tasks, max_completed_tasks)):
@@ -47,7 +40,7 @@ class RuntimeManager:
         self._client_factory = client_factory
         self._executor_factory = executor_factory
         self._client = None
-        self._sessions: dict[str, SessionRuntime] = {}
+        self._sessions: dict[str, GuideAgent] = {}
         # 只有不能构造 Session 的加载故障才在这里保存，已发布会话使用 Session.failure_reason。
         self._load_failures: dict[str, str] = {}
         self._owners: dict[str, str] = {}
@@ -77,14 +70,9 @@ class RuntimeManager:
                     logging.getLogger(__name__).warning("启动记忆处理失败（%s），继续问答", type(exc).__name__)
             self._semaphore = asyncio.Semaphore(self._limit)
             self._client = self._client_factory()
-            self._directory.client = self._client
             self.state = RuntimeState.RUNNING
         except BaseException:
-            try:
-                if self._client is not None:
-                    await self._client.close()
-            finally:
-                self.state = RuntimeState.CLOSED
+            self.state = RuntimeState.CLOSED
             raise
 
     def _check_loop(self) -> None:
@@ -96,15 +84,11 @@ class RuntimeManager:
         if self.state != RuntimeState.RUNNING:
             raise RuntimeError("Runtime 未接受新操作")
 
-    def _check_session(self, session_id: str) -> None:
+    def _check_idle(self, session_id: str) -> None:
         if not isinstance(session_id, str) or not session_id.strip():
             raise ValueError("Session ID 不能为空")
         if session_id in self._owners:
             raise RuntimeError("Session 已有已接受的任务")
-        if session_id in self._load_failures:
-            raise SessionIntegrityError(self._load_failures[session_id])
-        if session_id in self._sessions:
-            self._sessions[session_id].session.require_usable()
 
     def submit(self, session_id: str, question: str) -> str:
         if not isinstance(question, str) or not question.strip():
@@ -116,7 +100,11 @@ class RuntimeManager:
 
     def _submit(self, session_id, kind, question) -> str:
         self._accepting()
-        self._check_session(session_id)
+        self._check_idle(session_id)
+        if session_id in self._load_failures:
+            raise SessionIntegrityError(self._load_failures[session_id])
+        if session_id in self._sessions:
+            self._sessions[session_id].session.require_usable()
         if len(self._tasks) - len(self._completed) >= self._max_pending:
             raise RuntimeError("任务接收容量已满")
         key = uuid4().hex
@@ -134,30 +122,27 @@ class RuntimeManager:
         record.task.add_done_callback(lambda task: self._done(record, task))
         return key
 
-    async def _get_or_open(self, session_id: str) -> SessionRuntime:
+    async def _get_or_open(self, session_id: str) -> GuideAgent:
         if session_id not in self._sessions:
             try:
-                session = await blocking(self._directory.load, session_id)
-            except SessionNotFound:
-                raise
-            except Exception as exc:
+                session = await blocking(self._directory.load, session_id, self._client)
+            except SessionIntegrityError as exc:
                 self._load_failures[session_id] = str(exc)
-                raise SessionIntegrityError(f"加载会话失败：{exc}") from exc
+                raise
             executor = await blocking(self._executor_factory)
             await executor.initialize()
-            agent = GuideAgent(self._client, executor, session)
-            self._sessions[session_id] = SessionRuntime(session, agent, executor)
+            self._sessions[session_id] = GuideAgent(self._client, executor, session)
         return self._sessions[session_id]
 
     async def _execute(self, record: TaskRecord) -> None:
         async with self._semaphore:
             record.status = TaskStatus.RUNNING
             try:
-                runtime = await self._get_or_open(record.session_id)
+                agent = await self._get_or_open(record.session_id)
                 if record.kind == TaskKind.TURN:
-                    record.answer = await runtime.agent.ask(record.question)
+                    record.answer = await agent.ask(record.question)
                 else:
-                    record.result = await runtime.session.compact_now()
+                    record.result = await agent.session.compact_now(standalone=True)
             except (Exception, asyncio.CancelledError) as exc:
                 self._finalize_once(record, exc)
             else:
@@ -196,38 +181,60 @@ class RuntimeManager:
         self._check_loop()
         return dict(await asyncio.shield(self._tasks[task_id].completion))
 
-    async def _manage(self, operation, *args, exclusive_id=None, invalidate=False, **kwargs):
+    @contextmanager
+    def _manage(self, exclusive_id=None):
         self._accepting()
         finished = self._loop.create_future()
-        owner = uuid4().hex
         if exclusive_id is not None:
-            self._check_session(exclusive_id)
+            self._check_idle(exclusive_id)
+            owner = uuid4().hex
             self._owners[exclusive_id] = owner
         self._management.add(finished)
         try:
-            return await blocking(operation, *args, **kwargs)
+            yield
         finally:
-            if invalidate:
-                self._sessions.pop(exclusive_id, None)
-            self._release(exclusive_id, owner)
+            if exclusive_id is not None:
+                self._release(exclusive_id, owner)
             self._management.remove(finished)
             finished.set_result(None)
 
     async def create_session(self, name: str) -> str:
-        return await self._manage(self._directory.create_id, name)
+        with self._manage():
+            return await blocking(self._directory.create, name)
 
     async def list_sessions(self, **page) -> list[dict]:
-        return await self._manage(self._directory.get_sessions, **page)
+        with self._manage():
+            return await blocking(self._directory.list_sessions, **page)
 
     async def select_session(self, session_id: str) -> str:
-        # 用户选择只更新目录 usage，不读取或变更正在执行的 Session。
-        return await self._manage(self._directory.select, session_id)
+        with self._manage():
+            return await blocking(self._directory.record_open, session_id)
 
     async def archive_session(self, session_id: str, archived: bool = True) -> bool:
-        return await self._manage(self._directory.archived, session_id, archived, exclusive_id=session_id)
+        with self._manage(session_id):
+            return await blocking(self._directory.archive, session_id, archived)
 
     async def delete_session(self, session_id: str) -> bool:
-        return await self._manage(self._directory.delete, session_id, exclusive_id=session_id, invalidate=True)
+        with self._manage(session_id):
+            try:
+                deleted = await blocking(self._directory.delete, session_id, finish_on_cancel=True)
+            except SessionIntegrityError as exc:
+                # 目录提交结果无法确认，旧写入者不能复用。
+                agent = self._sessions.get(session_id)
+                if agent:
+                    agent.session.failure_reason = agent.session.failure_reason or str(exc)
+                raise
+            except LogCleanupError:
+                self._forget_deleted(session_id)
+                raise
+            self._forget_deleted(session_id)
+            return deleted
+
+    def _forget_deleted(self, session_id):
+        agent = self._sessions.pop(session_id, None)
+        if agent:
+            agent.session.failure_reason = "会话目录已删除"
+        self._load_failures.pop(session_id, None)
 
     async def shutdown(self) -> None:
         if self.state == RuntimeState.CREATED:
@@ -238,15 +245,14 @@ class RuntimeManager:
         if self.state == RuntimeState.CLOSED and self._closing is None:
             return
         self._check_loop()
-        if self._closing is None:
+        if self._closing is None or self._closing.cancelled():
             self.state = RuntimeState.CLOSING
             self._closing = asyncio.create_task(self._drain())
         await asyncio.shield(self._closing)
 
     async def _drain(self) -> None:
-        try:
-            await asyncio.gather(*(r.completion for r in self._tasks.values()), *self._management)
-            self._sessions.clear()
-            await self._client.close()
-        finally:
-            self.state = RuntimeState.CLOSED
+        await wait_finished(asyncio.gather(*(r.completion for r in self._tasks.values()), *self._management),
+                            finish_on_cancel=True)
+        self._sessions.clear()
+        await wait_finished(asyncio.create_task(self._client.close()), finish_on_cancel=True)
+        self.state = RuntimeState.CLOSED

@@ -14,7 +14,7 @@ from database.sqlite import get_connection
 from database.stage1_store import Stage1Store
 from history import HistoryStore
 from memory.phase1.event_reader import EventReader
-from session_manager import SessionManager
+from session_repository import SessionRepository
 
 
 class DataPathsTests(unittest.TestCase):
@@ -106,12 +106,12 @@ class DataPathsTests(unittest.TestCase):
             "threshold_ratio": 0.8,
             "retain_ratio": 0.16,
         }
-        manager = SessionManager(None, "system", settings)
-        session = manager.create("测试会话")
-        session_id = session.session_id
-        session.append_history([{
+        manager = SessionRepository("system", settings)
+        session_id = manager.create("测试会话")
+        session = manager.load(session_id, None)
+        session.commit_event({
             "type": "message", "turn": 1, "message": {"role": "user", "content": "你好"},
-        }])
+        })
         # 创建真实的日志完成边界，再验证水位可以随数据目录迁移。
         session.history.append([{"type": "message", "turn": 1, "message": {"role": "assistant", "content": "你好"}},
                                 {"type": "turn/end", "turn": 1, "reason": "completed"}])
@@ -119,7 +119,7 @@ class DataPathsTests(unittest.TestCase):
         paths = get_data_paths()
         with closing(get_connection()) as conn, conn:
             conn.execute("UPDATE stage1_outputs SET rollout_summary = '旧摘要' WHERE session_id = ?", (session_id,))
-        log_path = manager.get_sessions()[0]["event_log_path"]
+        log_path = manager.list_sessions()[0]["event_log_path"]
         self.assertEqual(log_path, f"sessions/{session_id}/events.jsonl")
         self.assertEqual(paths.resolve_event_log(session_id, log_path), session.history.path)
         self.assertEqual(list(paths.root.glob("*.db")), [paths.database])
@@ -128,15 +128,15 @@ class DataPathsTests(unittest.TestCase):
         shutil.copytree(paths.root, moved)
         os.environ["DSH_DATA_DIR"] = str(moved)
         get_data_paths.cache_clear()
-        manager = SessionManager(None, "system", settings)
-        self.assertEqual(manager.open(session_id).history.get(1)["message"]["content"], "你好")
+        manager = SessionRepository("system", settings)
+        self.assertEqual(manager.load(session_id, None).history.get(1)["message"]["content"], "你好")
         self.assertEqual(EventReader.for_session(session_id, log_path=log_path).read()[-1].seq, 1)
         with closing(get_connection()) as conn:
             row = conn.execute(
                 "SELECT rollout_summary FROM stage1_outputs WHERE session_id = ?", (session_id,),
             ).fetchone()
         self.assertEqual(row["rollout_summary"], "旧摘要")
-        session = manager.open(session_id)
+        session = manager.load(session_id, None)
         session.history.append([{"type": "message", "turn": 2, "message": {"role": "assistant", "content": "继续"}},
                                 {"type": "turn/end", "turn": 2, "reason": "completed"}])
         self.assertTrue(Stage1Store().record_turn_end(session_id, 5, 101))
@@ -149,12 +149,12 @@ class DataPathsTests(unittest.TestCase):
                 "INSERT INTO sessions (session_id, event_log_path, name, created_at) VALUES (?, ?, ?, ?)",
                 ("legacy", str(legacy), "旧会话", 100),
             )
-        self.assertEqual(manager.open("legacy").history.path, legacy)
+        self.assertEqual(manager.load("legacy", None).history.path, legacy)
         self.assertEqual(EventReader.for_session("legacy", log_path=legacy).path, legacy)
         with closing(get_connection()) as conn, conn:
             conn.execute("UPDATE sessions SET event_log_path = ? WHERE session_id = 'legacy'", (str(paths.database),))
         with self.assertRaises(ValueError):
-            manager.open("legacy")
+            manager.load("legacy", None)
         with self.assertRaises(ValueError):
             manager.delete("legacy")
         self.assertTrue(paths.database.is_file())

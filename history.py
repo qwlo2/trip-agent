@@ -12,6 +12,10 @@ from typing import Any
 from data_paths import PROJECT_ROOT, get_data_paths
 
 
+class SessionIntegrityError(RuntimeError):
+    """日志、目录或投影不一致，禁止复用会话。"""
+
+
 class TurnEndReason(str, Enum):
     """问答结束原因：正常完成、执行异常或达到步骤上限。"""
 
@@ -35,30 +39,42 @@ class HistoryStore:
 
         未完成的末行不视为已提交事件，备份后截去；完整行损坏则明确报错。
         """
-        if self.path.exists():
+        try:
             content = self.path.read_bytes()
+        except FileNotFoundError:
+            content = b""
+        if content:
             committed_end = content.rfind(b"\n") + 1
             if committed_end != len(content):
                 backup = self.path.with_name(f"{self.path.name}.incomplete.{time.time_ns()}.bak")
                 shutil.copy2(self.path, backup)
-                with self.path.open("r+b") as target:
-                    target.truncate(committed_end)
-                    target.flush()
-                    os.fsync(target.fileno())
-            records = [json.loads(line) for line in content[:committed_end].splitlines()]
+                target = self.path.open("r+b")
+                try:
+                    with target:
+                        target.truncate(committed_end)
+                        target.flush()
+                        os.fsync(target.fileno())
+                except OSError as exc:
+                    self._write_failed = True
+                    raise SessionIntegrityError(f"日志尾部修复失败：{exc}") from exc
+            try:
+                records = [json.loads(line) for line in content[:committed_end].splitlines()]
+            except ValueError as exc:
+                raise SessionIntegrityError(f"日志 JSON 损坏：{exc}") from exc
         else:
             records = []
 
         if records:
-            if any(type(record["seq"]) is not int or record["seq"] != index for index, record in enumerate(records)):
-                raise ValueError("History seq 必须从 0 开始连续递增，不能重复或乱序")
+            if any(not isinstance(record, dict) or type(record.get("seq")) is not int or record["seq"] != index
+                   for index, record in enumerate(records)):
+                raise SessionIntegrityError("History seq 必须从 0 开始连续递增，不能重复或乱序")
             self._events = {record["seq"]: deepcopy(record) for record in records}
             self._next_seq = records[-1]["seq"] + 1
             self._write_failed = False
             return records
 
         if existing:
-            raise ValueError("已登记会话缺少完整的系统消息")
+            raise SessionIntegrityError("已登记会话缺少完整的系统消息")
         system_event = {
             "type": "message", "turn": 0,
             "message": {"role": "system", "content": system_prompt},
@@ -163,6 +179,8 @@ def validate_history(events: list[dict[str, Any]]) -> None:
             if turn is not None or pending or number <= previous_turn:
                 raise ValueError("非法 turn/start")
             structured = True
+            has_input = False
+            answer_step = None
             last_role = None
             previous_turn = turn = number
             previous_step = 0
@@ -178,10 +196,14 @@ def validate_history(events: list[dict[str, Any]]) -> None:
             if (turn is None and (structured or legacy_turn != number)) or step is not None or pending:
                 raise ValueError("非法 turn/end")
             reason = TurnEndReason(event["reason"])
-            if reason == TurnEndReason.COMPLETED and (last_role != "assistant" or (structured and not previous_step)):
-                raise ValueError("completed Turn 缺少已结束的回答步骤")
+            if reason == TurnEndReason.COMPLETED:
+                if last_role != "assistant" or (structured and (not has_input or answer_step != previous_step)):
+                    raise ValueError("completed Turn 缺少用户输入或已结束的回答步骤")
             turn = legacy_turn = None
         elif kind == "message":
+            usage = event.get("usage")
+            if usage is not None and (not isinstance(usage, dict) or type(usage.get("total_tokens")) is not int):
+                raise ValueError("消息 usage 缺少有效的 total_tokens")
             if event["message"]["role"] == "system":
                 raise ValueError("重复系统消息")
             if structured and (turn is None or event.get("step") != step):
@@ -191,8 +213,18 @@ def validate_history(events: list[dict[str, Any]]) -> None:
                     raise ValueError("旧会话 Turn 顺序错误")
                 previous_turn = legacy_turn = number
             last_role = event["message"]["role"]
+            if structured:
+                if last_role == "user" and step is None and not previous_step:
+                    content = event["message"].get("content")
+                    has_input = isinstance(content, str) and bool(content.strip())
+                elif last_role == "assistant":
+                    content = event["message"].get("content")
+                    answer_step = step if isinstance(content, str) and content.strip() else None
             track_message(event["message"], pending)
-        elif kind == "compaction/summary" and number != previous_turn:
-            raise ValueError("摘要不属于当前会话轮次")
+        elif kind == "compaction/summary":
+            if number != previous_turn:
+                raise ValueError("摘要不属于当前会话轮次")
+        elif kind not in {"tool/call", "tool/result"}:
+            raise ValueError(f"未知历史事件：{kind}")
     if turn is not None or step is not None or pending:
         raise ValueError("历史存在未闭合 Turn、Step 或工具调用")

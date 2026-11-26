@@ -13,7 +13,7 @@ from data_paths import get_data_paths
 from database.sqlite import get_connection, init_database
 from database.stage1_store import Stage1Store, _ADVANCE_PHASE2_SQL
 from history import HistoryStore
-from session import Session
+from session import Session, SessionIntegrityError
 
 
 SESSION_PAGE_SIZE = 25
@@ -23,65 +23,62 @@ class SessionNotFound(KeyError):
     """目录中没有请求的 Session。"""
 
 
-class SessionManager:
+class LogCleanupError(OSError):
+    """目录记录已确认删除，日志文件未能清理。"""
+
+
+class SessionRepository:
     """创建、打开、列出、归档和删除会话。"""
 
     def __init__(
         self,
-        client: AsyncTripClient | None,
         system_prompt: str,
         compact_settings: dict[str, Any],
     ) -> None:
-        """初始化表结构；复用客户端，每次打开会话时新建上下文及 Compact。
-
-        compact_settings 使用入口已校验的压缩配置，例如 load_compact_settings()。
-        客户端的创建和关闭由调用方负责。
-        """
+        """初始化目录和数据库；加载时显式接收本次使用的客户端。"""
         init_database()
         self.paths = get_data_paths()
-        self.client = client
         self.system_prompt = system_prompt
         self.compact_settings = dict(compact_settings)
 
-    def select(self, session_id: str) -> str:
+    def record_open(self, session_id: str) -> str:
         """只记录用户选择，不重新创建日志写入者。"""
         with closing(get_connection()) as conn, conn:
             if not conn.execute("UPDATE sessions SET usage=usage+1 WHERE session_id=?", (session_id,)).rowcount:
                 raise SessionNotFound(f"会话不存在：{session_id}")
         return session_id
 
-    def open(self, session_id: str) -> Session:
-        """供独立调用方打开会话；Runtime 加载使用 load()。"""
-        session = self.load(session_id)
-        self.select(session_id)
-        return session
-
-    def load(self, session_id: str) -> Session:
+    def load(self, session_id: str, client: AsyncTripClient) -> Session:
         """在事务外重放及验证，随后用短事务检查并补录完整 Turn 水位。"""
         with closing(get_connection()) as conn:
             row = conn.execute("SELECT event_log_path FROM sessions WHERE session_id=?", (session_id,)).fetchone()
         if row is None:
             raise SessionNotFound(f"会话不存在：{session_id}")
         path = self.paths.resolve_event_log(session_id, row["event_log_path"])
-        if not path.is_file():
-            raise FileNotFoundError(path)
-        session = Session(HistoryStore(path), ContextBuilder(), self.system_prompt,
-                          Compact(self.client, **self.compact_settings), session_id=session_id)
+        compact = Compact(client, **self.compact_settings)
+        session = Session(HistoryStore(path), ContextBuilder(), self.system_prompt, compact, session_id=session_id)
+        activity = int(path.stat().st_mtime)
         with closing(get_connection()) as conn, conn:
             conn.execute("BEGIN IMMEDIATE")
             row = conn.execute("SELECT last_completed_seq FROM stage1_outputs WHERE session_id=?",
                                (session_id,)).fetchone()
             watermark = row[0] if row else None
+            latest = session.last_completed_seq
             if watermark is not None:
+                if latest is None or watermark > latest or watermark < 0:
+                    raise SessionIntegrityError("SQLite 水位超出日志的 completed 事件范围")
                 event = session.history.get(watermark)
                 if event["type"] != "turn/end" or event.get("reason") != "completed":
-                    raise ValueError("SQLite 水位未对应日志的 completed 事件")
-            latest = session.last_completed_seq
+                    raise SessionIntegrityError("SQLite 水位未对应日志的 completed 事件")
+            conn.execute("""
+                UPDATE sessions SET updated_at=MAX(created_at, ?)
+                WHERE session_id=? AND (updated_at IS NULL OR updated_at < ?)
+            """, (activity, session_id, activity))
             if latest is not None and latest != watermark:
-                Stage1Store().record_turn_end(session_id, latest, int(path.stat().st_mtime), connection=conn)
+                Stage1Store().record_turn_end(session_id, latest, activity, connection=conn)
         return session
 
-    def get_sessions(self, limit: int = SESSION_PAGE_SIZE, offset: int = 0) -> list[dict[str, Any]]:
+    def list_sessions(self, limit: int = SESSION_PAGE_SIZE, offset: int = 0) -> list[dict[str, Any]]:
         """按使用次数降序返回未归档会话。
 
         每页默认 25 条，参考 Codex 会话选择器；offset 用于获取后续页。
@@ -102,7 +99,7 @@ class SessionManager:
             ).fetchall()
         return [dict(row) for row in rows]
 
-    def archived(self, session_id: str, is_archived: bool = True) -> bool:
+    def archive(self, session_id: str, is_archived: bool = True) -> bool:
         """设置归档标记，传入 False 可恢复展示；返回标记是否实际改变。"""
         with closing(get_connection()) as conn, conn:
             cursor = conn.execute(
@@ -148,17 +145,20 @@ class SessionManager:
             except sqlite3.Error as exc:
                 commit_error = exc
         if commit_error is not None:
-            with closing(get_connection()) as conn:
-                exists = conn.execute("SELECT 1 FROM sessions WHERE session_id=?", (session_id,)).fetchone()
+            try:
+                with closing(get_connection()) as conn:
+                    exists = conn.execute("SELECT 1 FROM sessions WHERE session_id=?", (session_id,)).fetchone()
+            except sqlite3.Error as exc:
+                raise SessionIntegrityError("无法确认会话删除事务结果") from exc
             if exists:
                 raise commit_error
         try:
             path.unlink(missing_ok=True)
         except OSError as exc:
-            raise OSError(f"数据库已删除会话，日志清理失败：{path}") from exc
+            raise LogCleanupError(f"数据库已删除会话，日志清理失败：{path}") from exc
         return True
 
-    def create_id(self, name: str) -> str:
+    def create(self, name: str) -> str:
         """先建立独有的日志，再发布目录记录；提交不确定时保留已有记录的文件。"""
         name = name.strip()
         if not name:
@@ -182,7 +182,3 @@ class SessionManager:
                 path.parent.rmdir()
             raise
         return session_id
-
-    def create(self, name: str) -> Session:
-        """为独立调用方返回已打开的新会话。"""
-        return self.load(self.create_id(name))

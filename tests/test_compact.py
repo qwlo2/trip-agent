@@ -88,9 +88,8 @@ class CompactTests(unittest.IsolatedAsyncioTestCase):
 
     def add(self, message):
         """持久化并追加一条具有 seq 身份的上下文消息。"""
-        event = self.session.append_history([{"type": "message", "turn": 1, "message": message}])[0]
-        self.session.append_context(message, seq=event["seq"])
-        return event["seq"]
+        self.session.commit_event({"type": "message", "turn": 1, "message": message})
+        return self.session.context.nodes()[-1].seq
 
     def populate(self):
         """生成超过默认阈值、但可安全缩减的上下文。"""
@@ -139,7 +138,14 @@ class CompactTests(unittest.IsolatedAsyncioTestCase):
         self.populate()
         original = self.session.context.nodes()
         original_log = self.path.read_bytes()
-        result = await self.session.compact_if_needed()
+        measured = []
+        measure = self.session.measure_context_tokens
+        def observe(*args):
+            measured.append(self.session.context.replace_generation)
+            return measure(*args)
+        with patch.object(self.session, "measure_context_tokens", observe):
+            result = await self.session.compact_if_needed()
+        self.assertEqual(measured, [0, 1])
         self.assertEqual(result.status, "compacted")
         nodes = self.session.context.nodes()
         self.assertEqual(nodes[0], original[0])
@@ -162,7 +168,7 @@ class CompactTests(unittest.IsolatedAsyncioTestCase):
         after = self.session.count_context_tokens()
         self.assertGreater(after, before + 600)
         self.session.tools_provider = None
-        self.session.append_history([{"type": "tool/call", "turn": 1, "payload": "x" * 10000}])
+        self.session.commit_event({"type": "tool/call", "turn": 1, "payload": "x" * 10000})
         self.assertEqual(self.session.count_context_tokens(), before)
         self.assertEqual((await self.session.compact_if_needed()).reason, "below_threshold")
 
@@ -266,12 +272,12 @@ class CompactTests(unittest.IsolatedAsyncioTestCase):
                 event["data"]["shadowedRange"] = boundary
                 event["surfaceOp"] = {"op": "replace", **boundary}
                 self.path.write_text("".join(json.dumps(item) + "\n" for item in bad))
-                with self.assertRaises(ValueError):
+                with self.assertRaises(SessionIntegrityError):
                     self.reopen()
         self.path.write_text(good)
         duplicate = self.session.history.get(result.summary_seq)
-        self.session.append_history([duplicate])
-        with self.assertRaises(ValueError):
+        self.session.history.append([duplicate])
+        with self.assertRaises(SessionIntegrityError):
             self.reopen()
 
     async def test_crash_after_log_commit_replays_replace(self):
@@ -283,7 +289,7 @@ class CompactTests(unittest.IsolatedAsyncioTestCase):
                 await self.session.compact_now()
         self.assertEqual(self.session.context.nodes(), before)
         with self.assertRaisesRegex(RuntimeError, "投影"):
-            self.session.append_history([{"type": "turn/start", "turn": 2}])
+            self.session.commit_event({"type": "turn/start", "turn": 2})
         restored = self.reopen()
         self.assertLess(len(restored.context), len(before))
         self.assertEqual(restored.context.nodes()[0].seq, 0)
@@ -293,10 +299,10 @@ class CompactTests(unittest.IsolatedAsyncioTestCase):
         event = {"type": "message", "turn": 1, "message": {"role": "user", "content": "saved"}}
         with patch("history.os.fsync", side_effect=OSError("disk failure")):
             with self.assertRaisesRegex(SessionIntegrityError, "disk failure") as caught:
-                self.session.append_history([event])
+                self.session.commit_event(event)
             self.assertIsInstance(caught.exception.__cause__, OSError)
         with self.assertRaisesRegex(RuntimeError, "重启"):
-            self.session.append_history([event])
+            self.session.commit_event(event)
         restored = self.reopen()
         self.assertEqual(restored.context.nodes()[-1].message["content"], "saved")
 
