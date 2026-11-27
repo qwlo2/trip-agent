@@ -94,7 +94,7 @@ async def run_trip():
     session_id = await asyncio.to_thread(directory.create, "杭州旅游")
     runtime = RuntimeManager(directory)
     try:
-        await runtime.start(session_id)
+        await runtime.start()
         task_id = runtime.submit(session_id, "杭州有哪些适合亲子游的景点？")
         result = await runtime.wait(task_id)
         print(result["error"] or result["answer"])
@@ -105,6 +105,7 @@ asyncio.run(run_trip())
 ```
 
 `SessionRepository` 管理目录。用户选择会话时增加使用次数，Runtime 首次执行任务时独占加载并验证日志。
+后台记忆任务立即扫描，串行执行 Phase 1、Phase 2，每轮结束后默认等待 120 秒。Phase 1 默认选择空闲至少 1800 秒的会话。
 运行期间通过 Runtime 的创建、选择、分页、归档和删除接口访问目录。删除先提交 SQLite，再清理日志。
 命令行从 `sessions` 表列出已登记的会话。
 此前由独立问答入口生成、尚未登记的 `sessions/default/events.jsonl` 或 `history.jsonl`
@@ -190,7 +191,7 @@ History 仅保存事件数据，LLM 响应的完整 `usage` 保存在事件顶�
 ## Compact 接口及执行流程
 
 `Compact(client, context_window=..., max_output_tokens=..., threshold_ratio=..., retain_ratio=...)`
-使用现有同步 Client，由 Session 持有。Compact 不保存 Session，执行时临时接收 session 参数。
+使用共享 AsyncTripClient，每个 Session 持有独立的 Compact。Compact 不保存 Session，执行时临时接收 session 参数。
 配置放在 `.env`，由根目录 `settings_loader.py` 统一读取并转换类型，
 使用 `.env.example` 提供缺省值；`main.py` 的 `load_compact_settings()`
 负责业务约束校验并组装构造参数。Memory 使用同一加载器读取
@@ -252,7 +253,7 @@ Compact 直接使用摘要正文，记录替换前后的 Token 成本，不额�
 
 组件划分：
 
-- `client.py`：基础 LLM 客户端 `Trip_Client`，负责询问与响应解析。
+- `client.py`：基础 LLM 客户端 `AsyncTripClient`，负责询问与响应解析。
 - `tool_executor.py`：`ToolExecutor`，负责工具注册和调用。
 - `history.py`：`HistoryStore` 和 `TurnEndReason`，负责事件编号、追加、读取与清空。
 - `tokens.py`：`Tokens`，统计单条消息、缓存上下文总量并提供压缩阈值判断。
@@ -337,7 +338,7 @@ MCP 查询失败时，工具返回错误结果给模型；工具发现失败时�
 
 ## LLM 响应
 
-`Trip_Client.ask(messages, tools=None)` 接收外部工具列表，省略时为普通对话。
+`AsyncTripClient.ask(messages, tools=None)` 接收外部工具列表，省略时为普通对话。
 
 `ask()` 发送一次请求，直接返回 SDK 原始 `ChatCompletion` 响应，不自动解析。
 `GuideAgent.ask()` 先将 `response.choices[0].message.model_dump(exclude_none=True)`
@@ -353,11 +354,11 @@ MCP 查询失败时，工具返回错误结果给模型；工具发现失败时�
 历史和后续请求直接使用 SDK 原始消息字典，保留原始工具参数与推理内容。
 `Message` 用于解析后判断是否执行工具及读取回复正文。
 
-Trip_Client 不执行工具、不维护对话历史、不自动重试。Agent 记录原始消息后，
+AsyncTripClient 不执行工具、不维护对话历史、不自动重试。Agent 记录原始消息后，
 执行工具并追加带对应 `tool_call_id` 的
 `role="tool"` 消息，随后再次调用 `ask()`。`metadata["finish_reason"]` 为
 `length` 表示输出被截断，
 Agent 应检查结束原因；无效的工具参数 JSON 会直接抛出解析异常。
 网络和 API 错误保留 SDK 原始异常，由调用方处理。
 
-如已有 SDK `ChatCompletion` 对象，可直接调用 `Trip_Client.parse_response(response)`。
+如已有 SDK `ChatCompletion` 对象，可直接调用 `AsyncTripClient.parse_response(response)`。

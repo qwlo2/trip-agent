@@ -10,7 +10,7 @@ from unittest.mock import Mock, patch
 from openai.types.chat import ChatCompletion
 
 from agent import GuideAgent
-from client import Trip_Client
+from client import AsyncTripClient
 from compact import Compact
 from context_builder import ContextBuilder, SurfaceNode
 from history import HistoryStore
@@ -62,7 +62,7 @@ class FakeClient:
             return self.summary_response
         return self.normal_responses.pop(0)
 
-    parse_response = staticmethod(Trip_Client.parse_response)
+    parse_response = staticmethod(AsyncTripClient.parse_response)
 
 
 class FakeAsyncClient(FakeClient):

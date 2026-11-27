@@ -1,5 +1,6 @@
 """通过离线模型、真实日志和临时 SQLite 验证记忆使用闭环。"""
 
+import asyncio
 import json
 import os
 import sqlite3
@@ -16,10 +17,11 @@ from database.sqlite import get_connection
 from database.stage1_store import Stage1Store
 from memory.reader import search_memory, truncate_middle_with_token_budget, turn_memory_prompt
 from memory.search import MAX_CONTENT, MAX_MATCHES, MAX_OUTPUT_BYTES
+from memory.settings_loader import load_config
 from memory.memory_maneger import MemoryManager
 from session import SessionIntegrityError
 from session_repository import SessionRepository
-from test_compact import FakeAsyncClient, FakeClient, completion, response, tool_call
+from test_compact import FakeAsyncClient, completion, response, tool_call
 from tool_executor import ToolExecutor
 
 
@@ -372,8 +374,9 @@ class MemoryUsageTests(unittest.IsolatedAsyncioTestCase):
         await self.agent.ask("沿用此前决定")
         store = Stage1Store()
         store.record_turn_end("Z", 11, int(time.time()))
+        store.set_memory_enabled(self.session.session_id, False)
         claim = store.claim_stage1(scan_limit=20, max_running=1, max_age_days=1, min_idle_seconds=0,
-                                   lease_seconds=600, max_attempts=1, current_session_id=self.session.session_id)
+                                   lease_seconds=600, max_attempts=1)
         self.assertEqual(claim.session_id, "Z")
         self.assertTrue(store.commit_stage1_result("Z", 11, "更新摘要", "new", claim.ownership_token))
         self.assertEqual(self.usage("Z")[0], 1)
@@ -386,8 +389,7 @@ class MemoryUsageTests(unittest.IsolatedAsyncioTestCase):
         await self.agent.ask("我偏好公交。")
         with closing(get_connection()) as conn, conn:
             conn.execute("UPDATE sessions SET updated_at = ?", (int(time.time()) - 86400,))
-        with patch.object(self.client, "ask", FakeClient.ask.__get__(self.client)):
-            self.assertEqual(MemoryManager(self.client).run(), "updated")
+        self.assertEqual(await MemoryManager(self.client, asyncio.Lock(), load_config()).run(), "updated")
         self.assertEqual(self.path.read_text().strip(), "偏好公交")
         _, phase1, phase2 = self.client.requests
         self.assertIsNone(phase1[1])
@@ -397,10 +399,265 @@ class MemoryUsageTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(options["response_format"], {"type": "json_object"})
             self.assertNotIn("used_session_ids", messages[0]["content"])
 
-    def test_phase2_runs_with_no_phase1_tasks(self):
-        manager = MemoryManager(self.client)
+    async def test_phase2_runs_with_no_phase1_tasks(self):
+        manager = MemoryManager(self.client, asyncio.Lock(), load_config())
         with patch.object(manager._phase1, "run", return_value={}), patch.object(
             manager._phase2, "run", return_value="unchanged",
         ) as phase2:
-            self.assertEqual(manager.run(), "unchanged")
-            phase2.assert_called_once_with()
+            self.assertEqual(await manager.run(), "unchanged")
+            phase2.assert_awaited_once_with(manager._stopped)
+
+    def test_stage1_claim_retry_and_commit_boundaries(self):
+        store = Stage1Store()
+        sid = self.session.session_id
+        now = int(time.time())
+        options = dict(scan_limit=10, max_running=1, max_age_days=1, min_idle_seconds=0,
+                       lease_seconds=60, max_attempts=3)
+        def job():
+            with closing(get_connection()) as conn:
+                return dict(conn.execute("SELECT * FROM memory_jobs WHERE kind='stage1'").fetchone())
+        store.record_turn_end(sid, 100, now)
+        claim = store.claim_stage1(**options)
+        self.assertIsNone(job()["claimed_version"])
+        self.assertEqual(job()["retry_remaining"], 2)
+        self.assertTrue(store.fail_stage1(claim, "offline", retry_delay_seconds=0))
+        retry = store.claim_stage1(**options)
+        self.assertEqual(job()["retry_remaining"], 1)
+        store.record_turn_end(sid, 120, now)
+        for invalid_seq in (99, 121):
+            self.assertFalse(store.commit_stage1_result(sid, invalid_seq, "无效", "", retry.ownership_token))
+        store.record_turn_end(sid, 150, now)
+        self.assertFalse(store.commit_stage1_result(sid, 120, "stale", "", claim.ownership_token))
+        self.assertTrue(store.commit_stage1_result(sid, 120, "实际输入", "", retry.ownership_token))
+        row = job()
+        self.assertEqual((row["input_version"], row["last_success_version"], row["status"]), (120,120,"pending"))
+        next_claim = store.claim_stage1(**options)
+        self.assertFalse(store.fail_stage1(retry, "old", retry_delay_seconds=0))
+        store.set_memory_enabled(sid, False)
+        self.assertFalse(store.commit_stage1_result(sid, 150, "撤销", "", next_claim.ownership_token))
+        self.assertIsNone(job()["ownership_token"])
+        self.assertEqual(job()["status"], "pending")
+
+    def test_snapshot_ignores_unconfirmed_and_open_turns(self):
+        from memory.phase1.event_reader import EventReader
+        config = load_config()
+        self.assertEqual(config["max_read_bytes"], 8 * 1024 * 1024)
+        self.assertEqual((config["min_idle_seconds"],config["scan_interval_seconds"]), (1800,120))
+        sid = self.session.session_id
+        for seq, kind, turn in ((1,"message",1),(2,"turn/end",1),(3,"message",2),(4,"turn/end",2),(5,"turn/start",3)):
+            self.session.history.append([dict(type=kind, turn=turn, reason="completed",
+                                              message={"role":"user","content":str(seq)})])
+        reader = EventReader(self.session.history.path)
+        store = Stage1Store()
+        options = dict(scan_limit=10, max_running=1, max_age_days=1, min_idle_seconds=0,
+                       lease_seconds=60, max_attempts=3)
+        store.record_turn_end(sid, 2, int(time.time()))
+        claim = store.claim_stage1(**options)
+        self.assertEqual([e.seq for e in reader.read(claim=claim)], [1])
+        self.assertEqual(reader.source_max_seq, 2)
+        store.fail_stage1(claim, "offline", retry_delay_seconds=0)
+        store.record_turn_end(sid, 6, int(time.time()))
+        claim = store.claim_stage1(**options)
+        self.assertEqual(reader.read(claim=claim), [])
+        self.assertEqual(reader.source_max_seq, -1)
+
+    async def test_publish_lock_version_and_failed_git_restore(self):
+        from memory.phase2 import phase2
+        self.seed()
+        self.path.write_text("旧摘要")
+        manager = MemoryManager(self.client, asyncio.Lock(), load_config())
+        entered, release = asyncio.Event(), asyncio.Event()
+        async def model(*args, **kwargs):
+            entered.set()
+            await asyncio.wait_for(release.wait(), 4)
+            return response('{"action":"replace","summary":"新摘要"}')
+        with patch.object(self.client, "ask", model):
+            task = asyncio.create_task(manager.run())
+            try:
+                await asyncio.wait_for(entered.wait(), 4)
+                self.assertIn("旧摘要", await asyncio.wait_for(manager.prompt(), 4))
+                self.seed("B")
+                Stage1Store().set_allow_global("B", False)
+            finally:
+                release.set()
+            self.assertEqual(await asyncio.wait_for(task, 4), "updated")
+        self.assertIn("新摘要", await manager.prompt())
+        with closing(get_connection()) as conn, conn:
+            job = conn.execute("SELECT * FROM memory_jobs WHERE kind='phase2'").fetchone()
+            self.assertEqual((job["status"], job["last_success_version"], job["input_version"]), ("pending",0,1))
+            conn.execute("UPDATE memory_jobs SET started_at=0 WHERE kind='phase2'")
+            conn.execute("UPDATE stage1_outputs SET rollout_summary='改变' WHERE session_id='A'")
+        git = phase2._git
+        def failing_git(root, *args):
+            if args[0] == "commit":
+                raise OSError("git")
+            return git(root, *args)
+        self.client.normal_responses = [response('{"action":"replace","summary":"未提交"}')]
+        with patch.object(phase2, "_git", failing_git), self.assertLogs("memory.memory_maneger"):
+            await manager.run()
+        self.assertIn("新摘要", await manager.prompt())
+        self.path.write_text("中断写入")
+        await manager.recover()
+        self.assertIn("新摘要", await manager.prompt())
+
+    async def test_revoked_source_prevents_publish_and_finish_failure_keeps_git(self):
+        self.seed()
+        self.path.write_text("旧摘要")
+        manager = MemoryManager(self.client, asyncio.Lock(), load_config())
+        async def revoke(*args, **kwargs):
+            Stage1Store().set_memory_enabled("A", False)
+            return response('{"action":"replace","summary":"失效"}')
+        with patch.object(self.client, "ask", revoke), self.assertLogs("memory.memory_maneger"):
+            await manager.run()
+        self.assertEqual(self.path.read_text(), "旧摘要")
+        Stage1Store().set_memory_enabled("A", True)
+        with closing(get_connection()) as conn, conn:
+            conn.execute("UPDATE memory_jobs SET started_at=0 WHERE kind='phase2'")
+        self.client.normal_responses = [response('{"action":"replace","summary":"已提交"}')]
+        with patch.object(Phase2Store, "finish", side_effect=sqlite3.OperationalError("busy")), self.assertLogs("memory.memory_maneger"):
+            await manager.run()
+        self.assertEqual(self.path.read_text().strip(), "已提交")
+        await manager.recover()
+        self.assertEqual(self.path.read_text().strip(), "已提交")
+        with closing(get_connection()) as conn, conn:
+            row = conn.execute("SELECT status,last_success_version FROM memory_jobs WHERE kind='phase2'").fetchone()
+            self.assertEqual(tuple(row), ("running", None))
+            conn.execute("UPDATE memory_jobs SET started_at=0,lease_until=0 WHERE kind='phase2'")
+        self.assertEqual(await manager.run(), "unchanged")
+
+    def test_expired_stage1_lease_only_loses_ownership_on_reclaim(self):
+        store = Stage1Store()
+        sid = self.session.session_id
+        options = dict(scan_limit=10, max_running=1, max_age_days=1, min_idle_seconds=0,
+                       lease_seconds=60, max_attempts=3)
+        store.record_turn_end(sid, 10, int(time.time()))
+        first = store.claim_stage1(**options)
+        with closing(get_connection()) as conn, conn:
+            conn.execute("UPDATE memory_jobs SET lease_until=0 WHERE kind='stage1'")
+        self.assertTrue(store.commit_stage1_result(sid, 10, "保留摘要", "", first.ownership_token))
+        store.record_turn_end(sid, 20, int(time.time()))
+        expired = store.claim_stage1(**options)
+        with closing(get_connection()) as conn, conn:
+            conn.execute("UPDATE memory_jobs SET lease_until=0 WHERE kind='stage1'")
+        current = store.claim_stage1(**options)
+        self.assertNotEqual(current.ownership_token, expired.ownership_token)
+        self.assertFalse(store.fail_stage1(expired, "offline", retry_delay_seconds=0))
+        self.assertTrue(store.fail_stage1(current, "offline", retry_delay_seconds=0))
+        with closing(get_connection()) as conn:
+            row = conn.execute("SELECT source_max_seq,rollout_summary FROM stage1_outputs WHERE session_id=?", (sid,)).fetchone()
+            self.assertEqual(tuple(row), (10,"保留摘要"))
+        claim = store.claim_stage1(**options)
+        self.manager.delete(sid)
+        self.assertFalse(store.commit_stage1_result(sid, 20, "过期", "", claim.ownership_token))
+
+    async def test_phase1_uses_snapshot_across_foreground_progress(self):
+        from memory.phase1.phase1 import Phase1Agent
+        store = Stage1Store()
+        sid = self.session.session_id
+        def complete(turn, content):
+            records = self.session.history.append([
+                {"type":"message", "turn":turn, "message":{"role":"user", "content":content}},
+                {"type":"turn/end", "turn":turn, "reason":"completed"},
+            ])
+            store.record_session_activity(sid, int(time.time()), records[-1]["seq"])
+        complete(1, "领取前")
+        claim = store.claim_stage1
+        def advance_after_claim(**options):
+            result = claim(**options)
+            if result:
+                complete(2, "读取前")
+            return result
+        entered, release = asyncio.Event(), asyncio.Event()
+        async def extract(messages, **kwargs):
+            self.assertIn("读取前", messages[-1]["content"])
+            entered.set()
+            await asyncio.wait_for(release.wait(), 4)
+            return response('{"rollout_summary":"固定快照","rollout_slug":"snapshot"}')
+        with patch.dict(os.environ, MEMORY_PHASE1_MIN_IDLE_SECONDS="0"), patch.object(
+            Stage1Store, "claim_stage1", side_effect=advance_after_claim
+        ), patch.object(self.client, "ask", side_effect=extract) as model:
+            task = asyncio.create_task(Phase1Agent(self.client).run(asyncio.Event()))
+            try:
+                await asyncio.wait_for(entered.wait(), 4)
+                with closing(get_connection()) as conn:
+                    self.assertEqual(conn.execute("SELECT input_version FROM memory_jobs WHERE kind='stage1'").fetchone()[0], 2)
+                complete(3, "模型请求期间")
+            finally:
+                release.set()
+            self.assertEqual(await asyncio.wait_for(task, 4), {sid:"committed"})
+        model.assert_awaited_once()
+        self.assertIsNone(claim(scan_limit=10, max_running=1, max_age_days=1, min_idle_seconds=1800,
+                                lease_seconds=60, max_attempts=3))
+        with closing(get_connection()) as conn:
+            row = conn.execute("""SELECT last_completed_seq,source_max_seq,input_version,last_success_version,status
+                                  FROM stage1_outputs JOIN memory_jobs ON job_key=session_id WHERE kind='stage1'""").fetchone()
+            self.assertEqual(tuple(row), (6,4,4,4,"pending"))
+
+    async def test_initial_repo_recovery_and_uncertain_git_commit(self):
+        from memory.phase2 import phase2
+        manager = MemoryManager(self.client, asyncio.Lock(), load_config())
+        self.path.write_text("旧版工作区")
+        await manager.recover()
+        self.assertIn("旧版工作区", await manager.prompt())
+        phase2._git(self.path.parent, "init", "--quiet")
+        await manager.recover()
+        self.assertNotIn("旧版工作区", await manager.prompt())
+        self.seed()
+        self.client.normal_responses = [response('{"action":"replace","summary":"确认 HEAD"}')]
+        git = phase2._git
+        def uncertain(root, *args):
+            result = git(root, *args)
+            if args[0] == "commit":
+                raise OSError("commit acknowledgement lost")
+            return result
+        with patch.object(phase2, "_git", uncertain):
+            self.assertEqual(await manager.run(), "updated")
+        self.assertIn("确认 HEAD", await manager.prompt())
+        self.assertEqual(git(self.path.parent,"show","HEAD:memory_summary.md"), self.path.read_text())
+
+    async def test_stage1_failed_newer_snapshot_keeps_claim_retry_budget(self):
+        from memory.phase1.phase1 import Phase1Agent
+        from memory.phase1.event_reader import EventReader
+        sid = self.session.session_id
+        store = Stage1Store()
+        now = int(time.time())
+        options = dict(scan_limit=10, max_running=1, max_age_days=1, min_idle_seconds=0,
+                       lease_seconds=60, max_attempts=3)
+
+        def complete(turn, content):
+            events = self.session.history.append([
+                {"type": "message", "turn": turn, "message": {"role": "user", "content": content}},
+                {"type": "turn/end", "turn": turn, "reason": "completed"},
+            ])
+            store.record_turn_end(sid, events[-1]["seq"], now)
+
+        complete(1, "已提取")
+        first = store.claim_stage1(**options)
+        self.assertTrue(store.commit_stage1_result(sid, 2, "旧摘要", "", first.ownership_token))
+        complete(2, "领取版本")
+        retry = store.claim_stage1(**options)
+        self.assertTrue(store.fail_stage1(retry, "offline", retry_delay_seconds=0))
+
+        read = EventReader.read
+        def newer_snapshot(reader, **kwargs):
+            complete(3, "新输入")
+            return read(reader, **kwargs)
+
+        with patch.dict(os.environ, MEMORY_PHASE1_MIN_IDLE_SECONDS="0"), patch.object(
+            EventReader, "read", newer_snapshot
+        ), patch.object(self.client, "ask", side_effect=TimeoutError) as model, self.assertLogs("memory.phase1.phase1"):
+            self.assertEqual(await Phase1Agent(self.client).run(asyncio.Event()), {sid: "failed"})
+        model.assert_awaited_once()
+        self.assertIn("新输入", model.await_args.args[0][-1]["content"])
+        with closing(get_connection()) as conn:
+            row = conn.execute("""SELECT input_version,retry_remaining,status,retry_at,source_max_seq,
+                                         last_completed_seq,rollout_summary
+                                  FROM memory_jobs JOIN stage1_outputs ON job_key=session_id
+                                  WHERE kind='stage1'""").fetchone()
+        self.assertEqual(tuple(row[:3]), (4, 1, "error"))
+        self.assertGreater(row["retry_at"], now)
+        self.assertEqual(tuple(row[4:]), (2, 6, "旧摘要"))
+        self.assertIsNotNone(store.claim_stage1(**options))
+        with closing(get_connection()) as conn:
+            self.assertEqual(tuple(conn.execute(
+                "SELECT input_version,retry_remaining FROM memory_jobs WHERE kind='stage1'").fetchone()), (6, 2))

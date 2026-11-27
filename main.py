@@ -104,7 +104,7 @@ async def main() -> None:
                                           partial(blocking, directory.record_open), partial(blocking, directory.create))
         if session_id is None:
             return
-        await runtime.start(session_id)
+        await runtime.start()
         print("导游已就绪。/sessions 或 /switch 切换，/clear 新建，/compact 压缩，"
               "/tasks 列表，/status、/wait、/result 后接任务 ID，/exit 退出。")
         while True:

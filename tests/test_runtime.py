@@ -385,8 +385,7 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_start_lifecycle_and_loop_affinity(self):
         rt = RuntimeManager(self.directory, client_factory=lambda: self.client)
-        with patch("runtime.manager.startup_memory", side_effect=ValueError("offline")), self.assertLogs("runtime.manager"):
-            await rt.start(self.a)
+        await rt.start()
         self.runtime = rt
         await rt.start()
         async def foreign():
@@ -423,29 +422,22 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
             loads.assert_called_once_with(self.a, self.client)
         self.assertEqual((await self.wait_task(rt.submit_compact(self.a)))["status"], "completed")
 
-    async def test_startup_memory_finishes_before_frontend(self):
-        entered, release = threading.Event(), self.gate(True)
-        order = []
-        def pipeline(session_id):
-            self.assertEqual(session_id, self.a)
+    async def test_background_memory_drains_after_foreground(self):
+        entered, release = asyncio.Event(), self.gate()
+        async def phase(agent, stopped):
             entered.set()
-            self.assertTrue(release.wait(4))
-            order.append("memory")
-        def frontend():
-            order.append("frontend")
-            return self.client
-        rt = RuntimeManager(self.directory, client_factory=frontend)
-        self.runtime = rt
-        with patch("runtime.manager.startup_memory", pipeline):
-            start = asyncio.create_task(rt.start(self.a))
-            self.assertTrue(await asyncio.to_thread(entered.wait, 4))
-            with self.assertRaises(RuntimeError):
-                rt.submit(self.a, "early")
-            with self.assertRaises(RuntimeError):
-                await rt.shutdown()
+            await asyncio.wait_for(release.wait(), 4)
+            raise ValueError("offline")
+        with patch("memory.memory_maneger.Phase1Agent.run", phase), self.assertLogs("memory.memory_maneger"):
+            rt = await self.setup_runtime(max_concurrent_tasks=1)
+            await asyncio.wait_for(entered.wait(), 4)
+            self.assertEqual((await self.wait_task(rt.submit(self.a, "A")))["status"], "completed")
+            shutdown = asyncio.create_task(rt.shutdown())
+            await asyncio.sleep(0)
+            self.client.close.assert_not_awaited()
             release.set()
-            await asyncio.wait_for(start, 4)
-        self.assertEqual(order, ["memory", "frontend"])
+            await asyncio.wait_for(shutdown, 4)
+            self.client.close.assert_awaited_once()
 
     async def test_replay_context_and_search_do_not_block_other_session(self):
         from agent import GuideAgent
@@ -530,7 +522,7 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
         loop_thread = threading.get_ident()
         with patch("main.RuntimeManager", partial(RuntimeManager, client_factory=lambda: self.client,
                                                  executor_factory=lambda: ToolExecutor(include_amap=False))), \
-                patch("runtime.manager.startup_memory"), patch("builtins.input", read), patch("builtins.print") as output:
+                patch("builtins.input", read), patch("builtins.print") as output:
             try:
                 await asyncio.wait_for(main.main(), 6)
             finally:

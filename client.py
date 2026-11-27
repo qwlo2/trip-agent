@@ -7,7 +7,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Sequence
 
-from openai import AsyncOpenAI, OpenAI
+from openai import AsyncOpenAI
 from openai.types.chat import ChatCompletion
 
 from settings_loader import load_settings
@@ -47,10 +47,10 @@ class Message:
     metadata: dict[str, Any] = field(default_factory=dict)
     """ field用来配置数据类中的成员变量,default_factory 的设计就是为了让每个实例获得独立的默认对象。"""
 
-class _TripClientBase:
-    """共享同步与异步请求的配置、参数及响应协议。"""
+class AsyncTripClient:
+    """前台问答和后台记忆共用的原生异步客户端。"""
 
-    sdk_class = OpenAI
+    sdk_class = AsyncOpenAI
 
     def __init__(self, env_file: str | Path | None = None) -> None:
         """加载配置并创建 SDK 客户端，不在初始化时发送请求。
@@ -115,7 +115,7 @@ class _TripClientBase:
         """
         choice = response.choices[0]
         message = choice.message.model_dump(exclude_none=True)
-        tool_calls = [Trip_Client.parse_tool_call(call) for call in message.get("tool_calls", [])]
+        tool_calls = [AsyncTripClient.parse_tool_call(call) for call in message.get("tool_calls", [])]
 
         return Message(
             role=choice.message.role,
@@ -137,11 +137,6 @@ class _TripClientBase:
             raise ValueError(f"工具 {function['name']} 的参数必须为 JSON 对象")
         return ToolCall(call["id"], function["name"], arguments)
 
-class AsyncTripClient(_TripClientBase):
-    """前台任务共享的异步客户端。"""
-
-    sdk_class = AsyncOpenAI
-
     async def ask(self, messages: Sequence[dict[str, Any]], tools: Sequence[dict[str, Any]] | None = None, *,
                   tool_choice: str | dict[str, Any] = "auto", temperature: float | None = None,
                   max_tokens: int | None = None, response_format: dict[str, Any] | None = None) -> ChatCompletion:
@@ -151,32 +146,3 @@ class AsyncTripClient(_TripClientBase):
 
     async def close(self) -> None:
         await self._api.close()
-
-
-class Trip_Client(_TripClientBase):
-    """启动记忆流水线使用的同步客户端。"""
-
-    def ask(self, messages: Sequence[dict[str, Any]], tools: Sequence[dict[str, Any]] | None = None, *,
-            tool_choice: str | dict[str, Any] = "auto", temperature: float | None = None,
-            max_tokens: int | None = None, response_format: dict[str, Any] | None = None) -> ChatCompletion:
-        options = self._request(messages, tools, tool_choice=tool_choice, temperature=temperature,
-                                max_tokens=max_tokens, response_format=response_format)
-        return self._api.chat.completions.create(**options)
-
-    def close(self) -> None:
-        """关闭底层 SDK 客户端，释放 HTTP 连接资源。"""
-        self._api.close()
-
-    def __enter__(self) -> Trip_Client:
-        """进入 with 上下文并返回当前客户端。"""
-        return self
-
-    def __exit__(self, exc_type: Any, exc_value: Any, traceback: Any) -> None:
-        """退出 with 上下文时关闭连接，上下文中的异常继续向外传播。
-
-        Args:
-            exc_type: 上下文中的异常类型，无异常时为 None。
-            exc_value: 上下文中的异常实例，无异常时为 None。
-            traceback: 异常的回溯对象，无异常时为 None。
-        """
-        self.close()

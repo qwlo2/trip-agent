@@ -1,14 +1,14 @@
 """单 Event Loop 的业务任务和会话所有权管理。"""
 
 import asyncio
-import logging
 from collections import deque
 from contextlib import contextmanager
 from enum import Enum
 from uuid import uuid4
 
 from agent import GuideAgent
-from client import AsyncTripClient, Trip_Client
+from client import AsyncTripClient
+from memory.settings_loader import load_config
 from memory.memory_maneger import MemoryManager
 from runtime.blocking import blocking, wait_finished
 from runtime.task import TaskKind, TaskRecord, TaskStatus
@@ -22,12 +22,6 @@ class RuntimeState(str, Enum):
     RUNNING = "running"
     CLOSING = "closing"
     CLOSED = "closed"
-
-
-def startup_memory(session_id: str) -> None:
-    """同步客户端的创建、记忆流水线和关闭都在启动 worker 中结束。"""
-    with Trip_Client() as client:
-        MemoryManager(client).run(current_session_id=session_id)
 
 
 class RuntimeManager:
@@ -54,8 +48,8 @@ class RuntimeManager:
         self._closing = None
         self.state = RuntimeState.CREATED
 
-    async def start(self, initial_session_id: str | None = None) -> None:
-        """绑定当前循环，在接收前台操作前结束可选的启动记忆任务。"""
+    async def start(self) -> None:
+        """恢复本地摘要后启动唯一的后台记忆任务。"""
         loop = asyncio.get_running_loop()
         if self.state == RuntimeState.RUNNING and loop is self._loop:
             return
@@ -63,15 +57,15 @@ class RuntimeManager:
             raise RuntimeError("Runtime 已启动、启动中或已关闭")
         self._loop = loop
         try:
-            if initial_session_id is not None:
-                try:
-                    await blocking(startup_memory, initial_session_id)
-                except Exception as exc:
-                    logging.getLogger(__name__).warning("启动记忆处理失败（%s），继续问答", type(exc).__name__)
             self._semaphore = asyncio.Semaphore(self._limit)
             self._client = self._client_factory()
+            self._memory = MemoryManager(self._client, asyncio.Lock(), await blocking(load_config))
+            await self._memory.recover()
+            self._memory_task = asyncio.create_task(self._memory.run_forever())
             self.state = RuntimeState.RUNNING
         except BaseException:
+            if self._client is not None:
+                await self._client.close()
             self.state = RuntimeState.CLOSED
             raise
 
@@ -131,7 +125,7 @@ class RuntimeManager:
                 raise
             executor = await blocking(self._executor_factory)
             await executor.initialize()
-            self._sessions[session_id] = GuideAgent(self._client, executor, session)
+            self._sessions[session_id] = GuideAgent(self._client, executor, session, memory_prompt=self._memory.prompt)
         return self._sessions[session_id]
 
     async def _execute(self, record: TaskRecord) -> None:
@@ -247,11 +241,13 @@ class RuntimeManager:
         self._check_loop()
         if self._closing is None or self._closing.cancelled():
             self.state = RuntimeState.CLOSING
+            self._memory.stop()
             self._closing = asyncio.create_task(self._drain())
         await asyncio.shield(self._closing)
 
     async def _drain(self) -> None:
-        await wait_finished(asyncio.gather(*(r.completion for r in self._tasks.values()), *self._management),
+        await wait_finished(asyncio.gather(*(r.completion for r in self._tasks.values()), *self._management,
+                                           self._memory_task, return_exceptions=True),
                             finish_on_cancel=True)
         self._sessions.clear()
         await wait_finished(asyncio.create_task(self._client.close()), finish_on_cancel=True)

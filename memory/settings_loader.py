@@ -8,6 +8,7 @@ from settings_loader import load_settings
 
 # Python 仅保留内部字段与环境变量名称的映射，默认参数由 .config.example 提供。
 _ENV_KEYS = {
+    "scan_interval_seconds": "MEMORY_SCAN_INTERVAL_SECONDS",
     "max_sessions": "MEMORY_PHASE1_MAX_SESSIONS",
     "scan_limit": "MEMORY_PHASE1_SCAN_LIMIT",
     "max_age_days": "MEMORY_PHASE1_MAX_AGE_DAYS",

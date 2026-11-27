@@ -8,34 +8,29 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from MCP.amap_mcp import AmapMCP
-from client import AsyncTripClient, Trip_Client
+from client import AsyncTripClient
 from tool_executor import ToolExecutionMode, ToolExecutor
 
 
 class TransportTests(unittest.IsolatedAsyncioTestCase):
-    async def test_clients_share_payload_and_keep_transport_modes(self):
+    async def test_async_client_payload_and_transport(self):
         config = {"DEEPSEEK_API_KEY": "local-test", "DEEPSEEK_MODEL": "test", "DEEPSEEK_TIMEOUT": 3,
                   "DEEPSEEK_BASE_URL": "https://example.invalid"}
-        sync_sdk, async_sdk = MagicMock(), MagicMock()
+        async_sdk = MagicMock()
         async_sdk.chat.completions.create = AsyncMock()
         async_sdk.close = AsyncMock()
         with patch("client.load_settings", return_value=config), \
-                patch.object(Trip_Client, "sdk_class", return_value=sync_sdk) as sync_factory, \
                 patch.object(AsyncTripClient, "sdk_class", return_value=async_sdk) as async_factory:
             async_client = AsyncTripClient()
-            with Trip_Client() as sync:
-                for tools in (None, [], [{"type": "function"}]):
-                    options = dict(temperature=.3, response_format={"type": "json_object"}, max_tokens=128)
-                    messages = [{"role": "user", "content": "test"}]
-                    sync.ask(messages, tools, **options)
-                    await async_client.ask(messages, tools, **options)
-                    args = async_sdk.chat.completions.create.await_args.kwargs
-                    self.assertEqual(args, sync_sdk.chat.completions.create.call_args.kwargs)
-                    self.assertEqual("tool_choice" in args, bool(tools))
-                    self.assertEqual("tools" in args, bool(tools))
-                    self.assertFalse(args["stream"])
+            for tools in (None, [], [{"type": "function"}]):
+                options = dict(temperature=.3, response_format={"type": "json_object"}, max_tokens=128)
+                messages = [{"role": "user", "content": "test"}]
+                await async_client.ask(messages, tools, **options)
+                args = async_sdk.chat.completions.create.await_args.kwargs
+                self.assertEqual("tool_choice" in args, bool(tools))
+                self.assertEqual("tools" in args, bool(tools))
+                self.assertFalse(args["stream"])
             await async_client.close()
-            self.assertEqual(sync_factory.call_args, async_factory.call_args)
             self.assertEqual(async_factory.call_args.kwargs["max_retries"], 0)
             async_sdk.close.assert_awaited_once()
 

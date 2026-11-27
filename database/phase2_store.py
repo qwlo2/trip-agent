@@ -80,6 +80,17 @@ class Phase2Store:
             )
             return Phase2Claim(token, version, memories)
 
+    def can_publish(self, claim: Phase2Claim) -> bool:
+        """在一次读取事务内核对所有权及来源权限，允许普通版本推进。"""
+        with closing(get_connection()) as conn:
+            conn.execute("BEGIN")
+            owned = conn.execute("""SELECT 1 FROM memory_jobs WHERE kind='phase2' AND job_key='global'
+                AND status='running' AND ownership_token=? AND claimed_version=?""",
+                (claim.token, claim.input_version)).fetchone()
+            return bool(owned) and all(conn.execute("""SELECT 1 FROM sessions JOIN stage1_outputs USING(session_id)
+                WHERE session_id=? AND memory_enabled=1 AND allow_global=1""", (item.session_id,)).fetchone()
+                for item in claim.memories)
+
     def finish(self, claim: Phase2Claim, *, error: str | None = None) -> bool:
         """仅结束自己领取的任务；成功时原子更新入选标记和成功版本。"""
         now = int(time.time())

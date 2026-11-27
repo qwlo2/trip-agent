@@ -22,11 +22,10 @@ _ADVANCE_PHASE2_SQL = """
 
 @dataclass(frozen=True)
 class Stage1Claim:
-    """一次 Phase 1 领取的日志路径、完整 Turn 版本和执行凭证。"""
+    """一次 Phase 1 领取的日志路径和执行凭证。"""
 
     session_id: str
     event_log_path: str
-    source_seq: int
     ownership_token: str
 
 
@@ -41,7 +40,6 @@ class Stage1Store:
         lease_seconds: int,
         max_attempts: int,
         excluded_sessions: tuple[str, ...] = (),
-        current_session_id: str | None = None,
     ) -> Stage1Claim | None:
         """原子领取最近的待处理会话；活跃租约和处于退避的同一版本不重复领取。"""
         placeholders = ",".join("?" for _ in excluded_sessions)
@@ -57,7 +55,6 @@ class Stage1Store:
                     FROM sessions AS s
                     JOIN stage1_outputs AS o ON o.session_id = s.session_id
                     WHERE s.is_archived = 0 AND s.memory_enabled = 1
-                      AND s.session_id IS NOT ?
                       AND o.last_completed_seq IS NOT NULL
                       AND COALESCE(s.updated_at, o.last_completed_at, s.created_at) BETWEEN ? AND ?
                     ORDER BY activity DESC, s.session_id
@@ -81,21 +78,21 @@ class Stage1Store:
                 ORDER BY c.activity DESC, c.session_id
                 LIMIT 1
                 """,
-                (current_session_id, now - max_age_days * 86400, now - min_idle_seconds,
+                (now - max_age_days * 86400, now - min_idle_seconds,
                  scan_limit, max_attempts, now, now, now, max_running, *excluded_sessions),
             ).fetchone()
             if row is None:
                 return None
 
             claim = Stage1Claim(
-                row["session_id"], row["event_log_path"], row["last_completed_seq"], uuid4().hex,
+                row["session_id"], row["event_log_path"], uuid4().hex,
             )
             conn.execute(
                 """
                 INSERT INTO memory_jobs (
                     kind, job_key, status, input_version, claimed_version, ownership_token,
                     lease_until, retry_remaining, started_at, updated_at
-                ) VALUES ('stage1', ?, 'running', ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES ('stage1', ?, 'running', ?, NULL, ?, ?, ?, ?, ?)
                 ON CONFLICT (kind, job_key) DO UPDATE SET
                     status = 'running', input_version = excluded.input_version,
                     claimed_version = excluded.claimed_version,
@@ -105,7 +102,7 @@ class Stage1Store:
                     started_at = excluded.started_at, finished_at = NULL,
                     updated_at = excluded.updated_at
                 """,
-                (claim.session_id, claim.source_seq, claim.source_seq, claim.ownership_token,
+                (claim.session_id, row["last_completed_seq"], claim.ownership_token,
                  now + lease_seconds, row["attempts"] - 1, now, now),
             )
             return claim
@@ -120,10 +117,10 @@ class Stage1Store:
                 SET status = 'error', claimed_version = NULL, ownership_token = NULL,
                     lease_until = NULL, retry_at = ?, last_error = ?, finished_at = ?, updated_at = ?
                 WHERE kind = 'stage1' AND job_key = ? AND status = 'running'
-                  AND ownership_token = ? AND claimed_version = ?
+                  AND ownership_token = ?
                 """,
                 (now + retry_delay_seconds, error, now, now,
-                 claim.session_id, claim.ownership_token, claim.source_seq),
+                 claim.session_id, claim.ownership_token),
             )
             return cursor.rowcount == 1
 
@@ -147,6 +144,12 @@ class Stage1Store:
                 "UPDATE sessions SET memory_enabled = ? WHERE session_id = ? AND memory_enabled <> ?",
                 (enabled, session_id, enabled),
             )
+            if cursor.rowcount:
+                conn.execute(_ADVANCE_PHASE2_SQL, (int(time.time()),))
+                if not enabled:
+                    conn.execute("""UPDATE memory_jobs SET status='pending', ownership_token=NULL,
+                                 claimed_version=NULL, lease_until=NULL WHERE kind='stage1'
+                                 AND job_key=? AND status='running'""", (session_id,))
             return cursor.rowcount == 1
 
     def record_turn_end(
@@ -191,7 +194,7 @@ class Stage1Store:
             previous = conn.execute(
                 """
                 SELECT outputs.last_completed_seq, outputs.rollout_summary,
-                       outputs.allow_global, jobs.input_version
+                       outputs.allow_global
                 FROM stage1_outputs AS outputs
                 JOIN memory_jobs AS jobs
                   ON jobs.kind = 'stage1' AND jobs.job_key = outputs.session_id
@@ -199,7 +202,8 @@ class Stage1Store:
                   AND jobs.status = 'running'
                   AND jobs.ownership_token = ?
                   AND jobs.ownership_token <> ''
-                  AND jobs.claimed_version = ?
+                  AND jobs.input_version <= ?
+                  AND EXISTS (SELECT 1 FROM sessions WHERE session_id=outputs.session_id AND memory_enabled=1)
                   AND outputs.last_completed_seq >= ?
                   AND (outputs.source_max_seq IS NULL OR outputs.source_max_seq < ?)
                 """,
@@ -218,8 +222,7 @@ class Stage1Store:
                 """,
                 (source_seq, summary, slug, now, session_id),
             )
-            input_version = max(previous["input_version"], previous["last_completed_seq"])
-            status = 'pending' if input_version > source_seq else 'done'
+            status = 'pending' if previous["last_completed_seq"] > source_seq else 'done'
             conn.execute(
                 """
                 UPDATE memory_jobs
@@ -228,7 +231,7 @@ class Stage1Store:
                     retry_at = NULL, last_error = NULL, finished_at = ?, updated_at = ?
                 WHERE kind = 'stage1' AND job_key = ?
                 """,
-                (source_seq, input_version, status, now, now, session_id),
+                (source_seq, source_seq, status, now, now, session_id),
             )
             if previous["allow_global"] and (previous["rollout_summary"] or summary):
                 conn.execute(_ADVANCE_PHASE2_SQL, (now,))

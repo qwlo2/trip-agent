@@ -51,8 +51,10 @@ def truncate_middle_with_token_budget(text: str, max_tokens: int) -> str:
     return f"{head}…{omitted_tokens} tokens truncated…{tail}"
 
 
-def turn_memory_prompt() -> str:
+def turn_memory_prompt(include_global: bool = True) -> str:
     """读取一次全局快照，使用 JSON 字符串界定参考资料正文。"""
+    if not include_global:
+        return _INSTRUCTIONS
     try:
         summary = get_data_paths().memory_summary.read_bytes().decode("utf-8")
     except FileNotFoundError:

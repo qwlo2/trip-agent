@@ -1,20 +1,22 @@
 """通过局部记忆文件的 Git 差异更新全局记忆。"""
 
+import asyncio
 import fcntl
 import json
 import os
 import re
 import subprocess
+from contextlib import ExitStack
 from functools import partial
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 from typing import Any
 
-from client import Trip_Client
+from runtime.blocking import blocking
+from client import AsyncTripClient
 from data_paths import DataPaths, get_data_paths
 from database.phase2_store import LocalMemory, Phase2Store
 from memory.phase1.event_filter import redact
-from memory.settings_loader import load_config
 from tool_executor import ToolExecutor
 
 
@@ -60,40 +62,72 @@ def _write(path: Path, content: str) -> None:
 class Phase2Agent:
     """领取并执行全局记忆整合，在局部记忆变化时启动模型对话。"""
 
-    def __init__(self, client: Trip_Client) -> None:
+    def __init__(self, client: AsyncTripClient, lock: asyncio.Lock, config) -> None:
         """借用调用方客户端，并加载 Memory 配置。"""
+        self.lock = lock
+        self.trusted = True
         self._client = client
-        self._config = load_config()
+        self._config = config
 
-    def run(self) -> str:
+    def recover(self):
+        """启动或提交结果不确定时，只信任已提交的摘要。"""
+        paths = get_data_paths()
+        root = paths.memories
+        if not (root / ".git").exists():
+            return
+        self.trusted = False
+        if (root / ".git").is_symlink() or not (root / ".git").is_dir():
+            raise ValueError("无效的记忆仓库")
+        if "# branch.oid (initial)" in _git(root, "status", "--porcelain=v2", "--branch", "-uno"):
+            return
+        summary = _git(root, "show", f"HEAD:{_SUMMARY}") if _git(root, "ls-tree", "HEAD", "--", _SUMMARY) else ""
+        _write(paths.memory_summary, summary)
+        self.trusted = True
+
+    async def run(self, stopped) -> str:
         """执行一轮全局整合；调用方负责初始化 SQLite 和管理客户端。"""
         config = self._config
         paths = get_data_paths()
-        paths.ensure_directories()
+        await blocking(paths.ensure_directories)
         store = Phase2Store()
         # 工作区锁覆盖模型请求与 Git 提交，避免租约过期时两个进程同时写文件。
-        directory = os.open(paths.memories, os.O_RDONLY | os.O_DIRECTORY)
-        try:
+        def acquire(stack):
+            directory = os.open(paths.memories, os.O_RDONLY | os.O_DIRECTORY)
+            stack.callback(os.close, directory)
             try:
                 fcntl.flock(directory, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError:
+                return False
+            return True
+
+        with ExitStack() as stack:
+            if not await blocking(acquire, stack):
                 return "skipped"
-            claim = store.claim(
+            if stopped.is_set():
+                return "skipped"
+            claim = await blocking(store.claim,
                 limit=config["phase2_max_items"], active_days=config["phase2_active_days"],
                 interval=config["phase2_interval_seconds"], max_retries=config["phase2_max_retries"],
             )
             if claim is None:
                 return "skipped"
             try:
-                outcome = self._update_workspace(paths, claim.memories)
-            except Exception as exc:
-                store.finish(claim, error=type(exc).__name__)
+                outcome = await self._update_workspace(paths, claim, store)
+            except (Exception, asyncio.CancelledError) as exc:
+                await blocking(store.finish, claim, error=type(exc).__name__)
                 raise
-            return outcome if store.finish(claim) else "lost_claim"
-        finally:
-            os.close(directory)
+            return outcome if await blocking(store.finish, claim) else "lost_claim"
 
-    def _update_workspace(self, paths: DataPaths, memories: tuple[LocalMemory, ...]) -> str:
+    async def _update_workspace(self, paths, claim, store):
+        previous, changes, patch, summaries = await blocking(self._prepare, paths, claim.memories)
+        summary = await self._consolidate(previous, changes, patch, summaries) if changes else previous
+        async with self.lock:
+            if not await blocking(store.can_publish, claim):
+                raise ValueError("全局记忆来源或所有权已失效")
+            await blocking(self._publish, paths, summary, previous)
+        return "updated" if summary != previous else "unchanged"
+
+    def _prepare(self, paths: DataPaths, memories: tuple[LocalMemory, ...]):
         """以 HEAD 为上次成功基线，整合后把来源与全局摘要提交到同一个 Git 版本。"""
         root = paths.memories
         git_dir = root / ".git"
@@ -131,23 +165,38 @@ class Phase2Agent:
         previous = (
             _git(root, "show", f"HEAD:{_SUMMARY}")
             if has_head and _git(root, "ls-tree", "HEAD", "--", _SUMMARY)
-            else (paths.memory_summary.read_text(encoding="utf-8") if paths.memory_summary.exists() else "")
+            else (paths.memory_summary.read_text(encoding="utf-8") if self.trusted and paths.memory_summary.exists() else "")
         )
-        summary = self._consolidate(previous, changes, patch, summaries) if changes else previous
-        _write(paths.memory_summary, summary)
-        _git(root, "add", "--", _SUMMARY)
-        if _git(root, "diff", "--cached", "--name-only"):
-            _git(root, "commit", "--quiet", "-m", "Update Phase 2 memory")
-        return "updated" if summary != previous else "unchanged"
+        return previous, changes, patch, summaries
 
-    def _consolidate(
+    def _publish(self, paths, summary, previous):
+        root = paths.memories
+        tree = None
+        self.trusted = False
+        try:
+            _write(paths.memory_summary, summary)
+            _git(root, "add", "--", _SUMMARY)
+            if _git(root, "diff", "--cached", "--name-only"):
+                tree = _git(root, "write-tree")
+                _git(root, "commit", "--quiet", "-m", "Update Phase 2 memory")
+        except Exception:
+            committed = (tree is not None
+                         and "# branch.oid (initial)" not in _git(root, "status", "--porcelain=v2", "--branch", "-uno")
+                         and _git(root, "rev-parse", "HEAD^{tree}") == tree)
+            if not committed:
+                _write(paths.memory_summary, previous)
+                self.trusted = True
+                raise
+        self.trusted = True
+
+    async def _consolidate(
         self, previous: str, changes: str, patch: str, summaries: dict[str, str],
     ) -> str:
         """为本次领取建立证据快照和工具，再循环收集工具调用及最终结果。"""
         sections = {
             "previous_memory": redact(previous),
             "changed_files": changes,
-            "git_patch": redact(patch),
+            "git_patch": await blocking(redact, patch),
             "current_files": "\n".join(summaries),
         }
         page_size = self._config["phase2_tool_page_chars"]
@@ -162,7 +211,7 @@ class Phase2Agent:
             end = offset + page_size
             return {"text": content[offset:end], "next_offset": end if end < len(content) else None}
 
-        executor = ToolExecutor(include_amap=False)
+        executor = await blocking(ToolExecutor, include_amap=False)
         offset = {"type": "integer", "minimum": 0, "description": "字符偏移量，默认 0"}
         executor.register_tool(
             "read_memory_workspace", "读取上次全局记忆、变更清单、Git 补丁或当前局部记忆文件名。",
@@ -188,11 +237,14 @@ class Phase2Agent:
             int(self._config["context_window"] * self._config["input_budget_ratio"]),
             self._config["context_window"] - output_tokens,
         )
+        def request_bytes(messages, tools):
+            return len(json.dumps({"messages": messages, "tools": tools}, ensure_ascii=False).encode("utf-8"))
+
         for _ in range(self._config["phase2_max_steps"]):
-            request = json.dumps({"messages": messages, "tools": tools}, ensure_ascii=False)
-            if len(request.encode("utf-8")) > budget * self._config["bytes_per_token"]:
+            request_size = await blocking(request_bytes, messages, tools)
+            if request_size > budget * self._config["bytes_per_token"]:
                 raise ValueError("Phase 2 子 Agent 对话超出配置的输入预算")
-            response = self._client.ask(
+            response = await self._client.ask(
                 messages, tools=tools, max_tokens=output_tokens,
                 response_format={"type": "json_object"},
             )

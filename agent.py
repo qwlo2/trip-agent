@@ -53,7 +53,7 @@ class GuideAgent:
         client: AsyncTripClient,
         executor: ToolExecutor,
         session: Session,
-        max_steps: int = 30,
+        max_steps: int = 30, *, memory_prompt=None,
     ) -> None:
         """注入基础组件并注册会话的压缩工具，组件的创建与关闭由调用方负责。
 
@@ -67,6 +67,7 @@ class GuideAgent:
         self.executor = executor
         self.session = session
         self.max_steps = max_steps
+        self._memory_prompt = memory_prompt
 
         async def compact_context():
             """使用会话默认行为执行模型发起的压缩。"""
@@ -102,7 +103,7 @@ class GuideAgent:
         try:
             await blocking(commit, {"type": "turn/start", "turn": turn})
             await blocking(commit, {"type": "message", "turn": turn, "message": {"role": "user", "content": question}})
-            memory_prompt = await blocking(turn_memory_prompt)
+            memory_prompt = await self._memory_prompt() if self._memory_prompt else await blocking(turn_memory_prompt)
             tools = await blocking(session.get_tools)
             response_format = {"type": "json_object"}
             correction = None

@@ -1,10 +1,13 @@
 """从已完成会话中提取局部记忆并提交到共享 SQLite。"""
 
+import asyncio
+import logging
 import json
 import re
 from typing import Any
 
-from client import Trip_Client
+from runtime.blocking import blocking
+from client import AsyncTripClient
 from database.stage1_store import Stage1Claim, Stage1Store
 from memory.phase1.event_filter import redact
 from memory.phase1.event_reader import EventReader
@@ -23,27 +26,27 @@ _SYSTEM_PROMPT = """你是旅游 Agent 的会话记忆提取器。阅读一段�
   如果没有可复用信息，两个字段都返回空字符串。"""
 
 
-def _extract(
-    client: Trip_Client,
+def _prepare(
     selector: InputSelector,
     claim: Stage1Claim,
     config: dict[str, Any],
     token_budget: int,
-) -> tuple[str, str]:
+):
     """读取领取的日志版本，复用事件筛选器，向模型请求并校验结构化摘要。"""
     reader = EventReader.for_session(claim.session_id, log_path=claim.event_log_path, config=config)
-    candidates = reader.read(max_seq=claim.source_seq)
-    if reader.source_max_seq != claim.source_seq:
-        raise ValueError("日志读取窗口内缺少本次领取的完整 Turn 边界")
-
+    candidates = reader.read(claim=claim)
     selection = selector.select(
-        candidates, session_id=claim.session_id, source_max_seq=claim.source_seq,
+        candidates, session_id=claim.session_id, source_max_seq=reader.source_max_seq,
         token_budget=token_budget,
     )
     if not selection.messages:
         raise ValueError("日志读取窗口和输入预算内没有可提取的消息")
 
-    response = client.ask(
+    return selection
+
+
+async def _extract(client, selection, config):
+    response = await client.ask(
         [
             {"role": "system", "content": _SYSTEM_PROMPT},
             {"role": "user", "content": selection.rendered_text},
@@ -68,13 +71,13 @@ def _extract(
 class Phase1Agent:
     """领取会话并提取局部记忆。"""
 
-    def __init__(self, client: Trip_Client) -> None:
+    def __init__(self, client: AsyncTripClient) -> None:
         """复用调用方管理的模型客户端。"""
         self._client = client
 
-    def run(self, *, current_session_id: str | None = None) -> dict[str, str]:
-        """处理一批会话并返回状态；调用方先初始化数据库，传入当前会话 ID 可排除它。"""
-        config = load_config()
+    async def run(self, stopped) -> dict[str, str]:
+        """串行处理一批会话，停止后结束领取。"""
+        config = await blocking(load_config)
         bytes_per_token = config["bytes_per_token"]
         # 预留系统提示、消息封装和输出容量，同样按近似 Token 估算输入。
         prompt_bytes = len(json.dumps([
@@ -89,26 +92,30 @@ class Phase1Agent:
         selector = InputSelector(config)
         outcomes = {}
         for _ in range(config["max_sessions"]):
-            claim = store.claim_stage1(
+            if stopped.is_set():
+                break
+            claim = await blocking(store.claim_stage1,
                 scan_limit=config["scan_limit"], max_running=config["max_sessions"],
                 max_age_days=config["max_age_days"], min_idle_seconds=config["min_idle_seconds"],
                 lease_seconds=config["lease_seconds"], max_attempts=config["max_attempts"],
-                excluded_sessions=tuple(outcomes), current_session_id=current_session_id,
+                excluded_sessions=tuple(outcomes),
             )
             if claim is None:
                 break
             try:
-                summary, slug = _extract(self._client, selector, claim, config, token_budget)
-            except Exception as exc:
-                # 不落盘 SDK 错误正文，避免保存请求和响应中的敏感内容。
-                failed = store.fail_stage1(
+                selection = await blocking(_prepare, selector, claim, config, token_budget)
+                summary, slug = await _extract(self._client, selection, config)
+                committed = await blocking(store.commit_stage1_result,
+                    claim.session_id, selection.source_max_seq, summary, slug, claim.ownership_token,
+                )
+            except (Exception, asyncio.CancelledError) as exc:
+                failed = await blocking(store.fail_stage1,
                     claim, type(exc).__name__, retry_delay_seconds=config["retry_delay_seconds"],
                 )
+                if isinstance(exc, asyncio.CancelledError):
+                    raise
+                logging.getLogger(__name__).warning("局部记忆提取失败（%s）", type(exc).__name__)
                 outcomes[claim.session_id] = "failed" if failed else "lost_claim"
-                continue
-
-            committed = store.commit_stage1_result(
-                claim.session_id, claim.source_seq, summary, slug, claim.ownership_token,
-            )
-            outcomes[claim.session_id] = "committed" if committed else "lost_claim"
+            else:
+                outcomes[claim.session_id] = "committed" if committed else "lost_claim"
         return outcomes

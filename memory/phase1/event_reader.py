@@ -2,6 +2,9 @@
 
 import json
 import os
+from contextlib import closing
+from database.stage1_store import Stage1Claim
+from database.sqlite import get_connection
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -50,7 +53,7 @@ class EventReader:
         path = paths.event_log(session_id) if log_path is None else paths.resolve_event_log(session_id, log_path)
         return cls(path, config)
 
-    def read(self, *, max_seq: int | None = None) -> list[MemoryCandidate]:
+    def read(self, *, max_seq: int | None = None, claim: Stage1Claim | None = None) -> list[MemoryCandidate]:
         """扫描文件末尾最多 max_read_bytes，返回按来源事件由新到旧的候选项。
 
         固定打开时的文件大小，忽略未以换行提交的末行和扫描边界上的残行。
@@ -66,6 +69,18 @@ class EventReader:
             source.seek(start - 1 if start else 0)
             data = source.read(snapshot_end - source.tell())
 
+        if claim is not None:
+            with closing(get_connection()) as conn:
+                row = conn.execute("""
+                    SELECT o.last_completed_seq, MAX(j.input_version, COALESCE(o.source_max_seq, -1) + 1)
+                    FROM stage1_outputs o JOIN sessions s USING(session_id)
+                    JOIN memory_jobs j ON j.kind='stage1' AND j.job_key=o.session_id
+                    WHERE o.session_id=? AND s.memory_enabled=1 AND j.status='running' AND j.ownership_token=?
+                """, (claim.session_id, claim.ownership_token)).fetchone()
+            if row is None:
+                return []
+            max_seq, min_seq = row
+
         lower = 0
         if start:
             lower = 1 if data[0:1] == b"\n" else data.find(b"\n", 1) + 1
@@ -80,7 +95,14 @@ class EventReader:
             record_bytes = end - begin + 1
             if record_bytes <= self.config["max_record_bytes"]:
                 event = json.loads(data[begin:end])
-                if event["seq"] == max_seq and (
+                if claim is not None and self.source_max_seq < 0:
+                    if (min_seq <= event["seq"] <= max_seq and event["type"] == "turn/end" and event.get("reason") == "completed"
+                            and type(event.get("turn")) is int and event["turn"] > 0):
+                        self.source_max_seq = event["seq"]
+                    else:
+                        end = previous
+                        continue
+                if claim is None and event["seq"] == max_seq and (
                     event["type"] != "turn/end" or event.get("reason") != "completed"
                     or type(event.get("turn")) is not int or event["turn"] < 1
                 ):
