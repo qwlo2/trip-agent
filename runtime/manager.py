@@ -2,7 +2,9 @@
 
 import asyncio
 from collections import deque
+from collections.abc import AsyncIterator
 from contextlib import contextmanager
+from dataclasses import asdict
 from enum import Enum
 from uuid import uuid4
 
@@ -11,6 +13,7 @@ from client import AsyncTripClient
 from memory.settings_loader import load_config
 from memory.memory_maneger import MemoryManager
 from runtime.blocking import blocking, wait_finished
+from runtime.events import TaskEvent, TaskEventBuffer
 from runtime.task import TaskKind, TaskRecord, TaskStatus
 from session import SessionIntegrityError
 from session_repository import LogCleanupError, SessionRepository
@@ -25,6 +28,12 @@ class RuntimeState(str, Enum):
 
 
 class RuntimeManager:
+    """RuntimeManager 仅允许由所属 Event Loop 调用。
+
+    默认线程池仅执行同步阻塞操作，不直接调用 RuntimeManager 公共接口。
+    普通公共接口依赖此调用契约，无需逐次校验事件循环归属。
+    """
+
     def __init__(self, directory: SessionRepository, *, max_concurrent_tasks: int = 4,
                  max_pending_tasks: int = 32, max_completed_tasks: int = 128,
                  client_factory=AsyncTripClient, executor_factory=ToolExecutor):
@@ -77,7 +86,6 @@ class RuntimeManager:
 
     def _accepting(self) -> None:
         """确认 Runtime 处于运行状态，可以接收新的前台任务或管理操作。"""
-        self._check_loop()
         if self.state != RuntimeState.RUNNING:
             raise RuntimeError("Runtime 未接受新操作")
 
@@ -109,9 +117,10 @@ class RuntimeManager:
         if len(self._tasks) - len(self._completed) >= self._max_pending:
             raise RuntimeError("任务接收容量已满")
         key = uuid4().hex
-        record = TaskRecord(key, session_id, kind, question, self._loop.create_future())
+        record = TaskRecord(key, session_id, kind, question, self._loop.create_future(), TaskEventBuffer(key))
         self._owners[session_id] = key
         self._tasks[key] = record
+        record.events.publish("task/queued", {"status": record.status.value})
         coroutine = self._execute(record)
         try:
             record.task = asyncio.create_task(coroutine)
@@ -140,9 +149,10 @@ class RuntimeManager:
         """取得并发许可后执行问答或独立压缩并保存结果。退出时归还许可，执行异常传播至 Task。"""
         async with self._semaphore:
             record.status = TaskStatus.RUNNING
+            record.events.publish("task/running", {"status": record.status.value})
             agent = await self._get_or_open(record.session_id)
             if record.kind == TaskKind.TURN:
-                record.answer = await agent.ask(record.question)
+                record.answer = await agent.ask(record.question, emit=record.events.publish)
             else:
                 record.result = await agent.session.compact_now(standalone=True)
 
@@ -160,7 +170,10 @@ class RuntimeManager:
                 record.status = TaskStatus.FAILED
                 record.error = f"{type(error).__name__}: {error}"
         self._release(record.session_id, record.task_id)
-        record.completion.set_result(record.snapshot())
+        snapshot = record.snapshot()
+        event_data = snapshot if record.result is None else {**snapshot, "result": asdict(record.result)}
+        record.events.publish("task/end", event_data)
+        record.completion.set_result(snapshot)
         self._completed.append(record.task_id)
         if len(self._completed) > self._max_completed:
             del self._tasks[self._completed.popleft()]
@@ -172,28 +185,31 @@ class RuntimeManager:
 
     def cancel(self, task_id: str) -> bool:
         """请求取消已接受的前台任务。首次接受返回 True，正在取消或已结束时返回 False。"""
-        self._check_loop()
         record = self._tasks[task_id]
         if record.completion.done() or record.status == TaskStatus.CANCELLING:
             return False
         if not record.task.cancel():
             return False
         record.status = TaskStatus.CANCELLING
+        record.events.publish("task/cancelling", {"status": record.status.value})
         return True
 
     def get_task(self, task_id: str) -> dict:
         """按 ID 获取任务当前状态与结果的快照。ID 不存在时抛出 KeyError。"""
-        self._check_loop()
         return self._tasks[task_id].snapshot()
 
     def list_tasks(self) -> list[dict]:
         """返回当前仍登记的所有前台任务快照，包含未结束任务和保留的终态任务。"""
-        self._check_loop()
         return [record.snapshot() for record in self._tasks.values()]
+
+    async def events(self, task_id: str, *, after: int = 0) -> AsyncIterator[TaskEvent]:
+        """从指定游标重放并订阅事件。已经开始的订阅可以读取到任务回收之后。"""
+        record = self._tasks[task_id]
+        async for event in record.events.subscribe(after):
+            yield event
 
     async def wait(self, task_id: str) -> dict:
         """等待结束回调发布最终快照。取消等待方时，业务 Task 和结果 Future 仍独立运行。"""
-        self._check_loop()
         return dict(await asyncio.shield(self._tasks[task_id].completion))
 
     @contextmanager
@@ -267,7 +283,6 @@ class RuntimeManager:
             return
         if self.state == RuntimeState.CLOSED and self._closing is None:
             return
-        self._check_loop()
         if self._closing is None or self._closing.cancelled():
             self.state = RuntimeState.CLOSING
             self._memory.stop()

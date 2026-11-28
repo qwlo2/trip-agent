@@ -37,7 +37,7 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.a, self.b = (self.directory.create(key) for key in ("A", "B"))
         self.client = AsyncMock()
         self.client.model = "test"
-        self.client.ask.return_value = completion("完成")
+        self.client.ask_stream.return_value = completion("完成")
         self.runtime = None
         self.release = []
 
@@ -71,11 +71,12 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
 
         async def ask(messages, **kwargs):
             q = messages[-1]["content"]
+            kwargs["on_delta"](q)
             entered[q].set()
             await asyncio.wait_for(release[q].wait(), 5)
             return completion(q)
 
-        self.client.ask.side_effect = ask
+        self.client.ask_stream.side_effect = ask
         a = rt.submit(self.a, "A")
         await asyncio.wait_for(entered["A"].wait(), 5)
         await rt.select_session(self.b)
@@ -88,7 +89,12 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(rt.get_task(a)["status"], "running")
         release["A"].set()
         self.assertEqual((await self.wait_task(a))["answer"], "A")
-        for sid, answer in ((self.a, "A"), (self.b, "B")):
+        for key, sid, answer in ((a, self.a, "A"), (b, self.b, "B")):
+            events = [event async for event in rt.events(key)]
+            self.assertEqual([e.type for e in events], ["task/queued", "task/running", "step/start", "llm/start",
+                                                       "llm/content_delta", "llm/end", "step/end", "task/end"])
+            self.assertEqual(events[4].data["delta"], answer)
+            self.assertFalse(any(e["type"].startswith("llm/") for e in self.events(sid)))
             self.assertEqual(json.loads(self.events(sid)[-3]["message"]["content"])["answer"], answer)
             self.assertEqual(self.events(sid)[-1]["reason"], "completed")
 
@@ -101,7 +107,7 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
             await asyncio.wait_for(release.wait(), 5)
             return completion("A")
 
-        self.client.ask.side_effect = ask
+        self.client.ask_stream.side_effect = ask
         a = rt.submit(self.a, "A")
         await asyncio.wait_for(entered.wait(), 5)
         b = rt.submit_compact(self.b)
@@ -115,12 +121,115 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
         waiter.cancel()
         with self.assertRaises(asyncio.CancelledError):
             await waiter
+        retained = rt.events(a)
+        self.assertEqual((await anext(retained)).type, "task/queued")
         waiting = asyncio.create_task(rt.wait(a))
         release.set()
         self.assertEqual((await self.wait_task(b))["result"].status, "skipped")
         self.assertEqual((await waiting)["answer"], "A")
         with self.assertRaises(KeyError):
             rt.get_task(a)
+        with self.assertRaises(KeyError):
+            await anext(rt.events(a))
+        await rt.shutdown()
+        tail = [event async for event in retained]
+        self.assertEqual([e.data["answer"] for e in tail if e.type == "task/end"], ["A"])
+        compact_events = [e async for e in rt.events(b)]
+        self.assertEqual([e.type for e in compact_events], ["task/queued", "task/running", "task/end"])
+        self.assertEqual(compact_events[-1].data["result"]["status"], "skipped")
+
+    async def test_partial_stream_cleanup_before_release_and_network_error(self):
+        import httpx
+        from openai import AsyncOpenAI
+        from client import AsyncTripClient
+        from test_streaming import Body, chunk
+
+        entered_close, release_close = asyncio.Event(), self.gate()
+        partial = chunk(dict(role="assistant", content="partial", tool_calls=[
+            dict(index=0, id="pending", type="function", function=dict(name="echo", arguments="{"))]))
+
+        class HeldClose(Body):
+            async def aclose(self):
+                entered_close.set()
+                await asyncio.wait_for(release_close.wait(), 4)
+                await super().aclose()
+
+        body = HeldClose([partial, asyncio.Event()])
+        broken = Body([partial, httpx.ReadError("断流")])
+        ok = Body([chunk(completion("B").choices[0].message.model_dump(exclude_none=True), "stop")])
+        bodies = iter([body, ok, broken])
+        transport = httpx.MockTransport(lambda _: httpx.Response(200, stream=next(bodies),
+                                                                  headers={"content-type": "text/event-stream"}))
+        client = AsyncTripClient.__new__(AsyncTripClient)
+        client.model = "test"
+        client._api = AsyncOpenAI(api_key="test", max_retries=0, http_client=httpx.AsyncClient(transport=transport))
+        self.client = client
+        rt = await self.setup_runtime()
+        key = rt.submit(self.a, "A")
+        await asyncio.wait_for(body.entered.wait(), 4)
+        subscriber = rt.events(key)
+        while (await asyncio.wait_for(anext(subscriber), 4)).type != "llm/content_delta":
+            pass
+        entered_wait = asyncio.Event()
+
+        async def read_next():
+            entered_wait.set()
+            return await anext(subscriber)
+
+        waiting = asyncio.create_task(read_next())
+        await asyncio.wait_for(entered_wait.wait(), 4)
+        waiting.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await waiting
+        self.assertEqual(rt.get_task(key)["status"], "running")
+        self.assertTrue(rt.cancel(key))
+        self.assertFalse(rt.cancel(key))
+        await asyncio.wait_for(entered_close.wait(), 4)
+        with self.assertRaises(RuntimeError):
+            rt.submit(self.a, "重复")
+        self.assertEqual((await self.wait_task(rt.submit(self.b, "B")))["answer"], "B")
+        release_close.set()
+        self.assertEqual((await self.wait_task(key))["status"], "cancelled")
+        self.assertTrue(body.closed)
+        events = [e.type async for e in rt.events(key)]
+        self.assertEqual(events[-3:], ["llm/content_delta", "task/cancelling", "task/end"])
+        failed = rt.submit(self.a, "重试")
+        self.assertEqual((await self.wait_task(failed))["status"], "failed")
+        self.assertTrue(broken.closed)
+        for key in (key, failed):
+            events = [e.type async for e in rt.events(key)]
+            self.assertEqual(events.count("task/end"), 1)
+            self.assertFalse({"llm/end", "tool/start"} & set(events))
+        roles = [e["message"]["role"] for e in self.events(self.a) if e["type"] == "message"]
+        self.assertFalse({"assistant", "tool"} & set(roles))
+        self.assertFalse(client._api.is_closed())
+
+    async def test_watch_displays_steps_and_committed_answer(self):
+        from contextlib import redirect_stdout
+        from io import StringIO
+        from main import watch
+
+        rt = await self.setup_runtime()
+        replies = iter((response("bad"), completion("已修正")))
+
+        async def model(*args, on_delta, **kwargs):
+            reply = next(replies)
+            on_delta(reply.choices[0].message.content)
+            return reply
+
+        self.client.ask_stream.side_effect = model
+        key = rt.submit(self.a, "A")
+        output = StringIO()
+        with redirect_stdout(output):
+            await asyncio.wait_for(watch(rt, key), 5)
+        text = output.getvalue()
+        self.assertLess(text.index("bad"), text.index("Step 2"))
+        self.assertIn(completion("已修正").choices[0].message.content, text)
+        self.assertTrue(text.endswith("任务结束 completed\n已修正\n"))
+        messages = [e["message"]["content"] for e in self.events(self.a)
+                    if e.get("message", {}).get("role") == "assistant"]
+        self.assertEqual(messages, ["bad", completion("已修正").choices[0].message.content])
+        self.client.ask.assert_not_awaited()
 
     async def test_creation_failure_early_cancel_and_old_callback(self):
         rt = await self.setup_runtime()
@@ -142,7 +251,7 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
             self.assertIsNone(result[field])
         self.assertFalse(rt.cancel(key))
         self.assertEqual(len(self.events(self.a)), 1)
-        self.client.ask.assert_not_awaited()
+        self.client.ask_stream.assert_not_awaited()
         new = rt.submit(self.a, "B")
         rt._done(old, old.task)
         self.assertEqual(list(rt._completed).count(key), 1)
@@ -157,7 +266,7 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
             entered.set()
             await asyncio.wait_for(release.wait(), 5)
 
-        self.client.ask.side_effect = ask
+        self.client.ask_stream.side_effect = ask
         a = rt.submit(self.a, "A")
         await asyncio.wait_for(entered.wait(), 5)
         b = rt.submit_compact(self.b)
@@ -210,7 +319,7 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_cancel_during_completed_commit_and_usage(self):
         rt = await self.setup_runtime()
-        self.client.ask.return_value = completion("已完成", "source")
+        self.client.ask_stream.return_value = completion("已完成", "source")
         entered, release = threading.Event(), self.gate(True)
         usage_entered, usage_release = threading.Event(), self.gate(True)
         original = Stage1Store.record_session_activity
@@ -259,7 +368,7 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
             await asyncio.wait_for(allow.wait(), 5)
             raise ValueError("offline")
 
-        self.client.ask.side_effect = held_ask
+        self.client.ask_stream.side_effect = held_ask
         with patch.object(self.directory, "create", held_create):
             management = asyncio.create_task(rt.create_session("new"))
             self.assertTrue(await asyncio.to_thread(entered.wait, 5))
@@ -298,7 +407,7 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
             return "ok"
 
         runtime.executor.register_tool("slow", "test", {}, tool, mode=ToolExecutionMode.BLOCKING)
-        self.client.ask.side_effect = [
+        self.client.ask_stream.side_effect = [
             response(None, calls=[tool_call("1", "slow"), tool_call("2", "compact_context")], finish="tool_calls"),
             completion("B"), completion("A"),
         ]
@@ -307,6 +416,8 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((await self.wait_task(rt.submit(self.b, "B")))["answer"], "B")
         release.set()
         self.assertEqual((await self.wait_task(a))["answer"], "A")
+        tools = [(e.type, e.data["tool_call_id"]) async for e in rt.events(a) if e.type.startswith("tool/")]
+        self.assertEqual(tools, [("tool/start", "1"), ("tool/end", "1"), ("tool/start", "2"), ("tool/end", "2")])
         self.assertEqual([e["message"]["tool_call_id"] for e in self.events(self.a)
                           if e.get("message", {}).get("role") == "tool"], ["1", "2"])
 
@@ -336,9 +447,9 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
         rt = await self.setup_runtime(max_concurrent_tasks=1)
         await self.wait_task(rt.submit(self.a, "a" * 4000))
         session = rt._sessions[self.a].session
-        self.client.ask.side_effect = [
-            response(None, calls=[tool_call("compact", "compact_context")], finish="tool_calls"), response("摘要"),
-        ]
+        self.client.ask.return_value = response("摘要")
+        self.client.ask_stream.return_value = response(
+            None, calls=[tool_call("compact", "compact_context")], finish="tool_calls")
         with patch.object(session.context, "replace", side_effect=ValueError("replace fault")):
             result = await self.wait_task(rt.submit(self.a, "压缩" * 1000))
         self.assertIn("replace fault", result["error"])
@@ -373,7 +484,7 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
     async def test_tool_ids_rejected_live_and_at_replay(self):
         rt = await self.setup_runtime()
         for ids in (("",), ("A", "A")):
-            self.client.ask.return_value = response(None, calls=[tool_call(i) for i in ids], finish="tool_calls")
+            self.client.ask_stream.return_value = response(None, calls=[tool_call(i) for i in ids], finish="tool_calls")
             result = await self.wait_task(rt.submit(self.a, "A"))
             self.assertIn("ID", result["error"])
             self.assertFalse(any(e.get("message", {}).get("tool_calls") for e in self.events(self.a)))
@@ -408,10 +519,9 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
         await rt.start()
         self.runtime = rt
         await rt.start()
-        async def foreign():
-            rt.submit(self.a, "foreign")
-        with self.assertRaisesRegex(RuntimeError, "Event Loop"):
-            await asyncio.to_thread(asyncio.run, foreign())
+        self.assertIs(rt._loop, asyncio.get_running_loop())
+        with self.assertRaisesRegex(RuntimeError, "Runtime 已启动"):
+            await asyncio.to_thread(asyncio.run, rt.start())
         broken = RuntimeManager(self.directory, client_factory=unittest.mock.Mock(side_effect=RuntimeError("startup")))
         with self.assertRaisesRegex(RuntimeError, "startup"):
             await broken.start()
@@ -487,7 +597,7 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
                 if name == "search" and messages[-1].get("content") == "search":
                     return response(None, calls=[tool_call("s", "search_memory", queries=["火车"])], finish="tool_calls")
                 return completion("ok")
-            self.client.ask.side_effect = ask
+            self.client.ask_stream.side_effect = ask
             with injection:
                 a = rt.submit(sid, name)
                 self.assertTrue(await asyncio.to_thread(entered.wait, 4))
@@ -538,7 +648,7 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
             else:
                 release.set()
             return completion(question)
-        self.client.ask.side_effect = ask
+        self.client.ask_stream.side_effect = ask
         commands = iter(("1", "A", "/switch", "2", "B", "/tasks", "/exit"))
         def read(prompt):
             command = next(commands)
@@ -566,7 +676,7 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
             if seq is not None:
                 raise sqlite3.OperationalError("watermark failed")
             return original(store, sid, when, seq)
-        self.client.ask.return_value = completion("已生成", "source")
+        self.client.ask_stream.return_value = completion("已生成", "source")
         with patch.object(Stage1Store, "record_session_activity", fail_watermark), \
                 patch.object(Phase2Store, "record_usage") as usage:
             result = await self.wait_task(rt.submit(self.a, "A"))
@@ -593,7 +703,7 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
             entered.set()
             await asyncio.Event().wait()
         rt._sessions[self.a].executor.register_tool("stall", "test", {}, stall, mode=ToolExecutionMode.ASYNC)
-        self.client.ask.return_value = response(None, calls=[tool_call("first", "done"), tool_call("A", "stall"), tool_call("B", "stall")],
+        self.client.ask_stream.return_value = response(None, calls=[tool_call("first", "done"), tool_call("A", "stall"), tool_call("B", "stall")],
                                                 finish="tool_calls")
         key = rt.submit(self.a, "A")
         await asyncio.wait_for(entered.wait(), 4)
@@ -607,7 +717,7 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
                          ["saved", {"error": "本轮已中止"}, {"error": "本轮已中止"}])
         self.assertEqual(events[-1]["reason"], "cancelled")
         self.directory.load(self.a, self.client)
-        self.client.ask.return_value = completion("继续")
+        self.client.ask_stream.return_value = completion("继续")
         self.assertEqual((await self.wait_task(rt.submit(self.a, "继续")))["answer"], "继续")
 
     async def test_load_lock_can_be_retried_and_activity_is_reconciled(self):
@@ -679,9 +789,9 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
                 entered.set()
                 self.assertTrue(release.wait(4))
                 return result
-            self.client.ask.side_effect = [response("摘要")] if sid == self.a else [
-                response(None, calls=[tool_call("compact", "compact_context")], finish="tool_calls"), response("摘要"),
-            ]
+            self.client.ask.return_value = response("摘要")
+            self.client.ask_stream.return_value = response(
+                None, calls=[tool_call("compact", "compact_context")], finish="tool_calls")
             with patch.object(compact, "commit_compaction", held):
                 key = rt.submit_compact(sid) if sid == self.a else rt.submit(sid, "请压缩")
                 self.assertTrue(await asyncio.to_thread(entered.wait, 4))
@@ -707,7 +817,7 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
             entered.set()
             await asyncio.wait_for(release.wait(), 4)
             return completion("已提交")
-        self.client.ask.side_effect = ask
+        self.client.ask_stream.side_effect = ask
         key = rt.submit(self.a, "A")
         await asyncio.wait_for(entered.wait(), 4)
         draining = asyncio.Event()
@@ -785,7 +895,7 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
         async def ask(*args, **kwargs):
             entered.set()
             await asyncio.Event().wait()
-        self.client.ask.side_effect = ask
+        self.client.ask_stream.side_effect = ask
         append = HistoryStore.append
         def fail_cleanup(history, events):
             if events[0]["type"] == "step/end":
@@ -821,7 +931,7 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
         async def ask(*args, **kwargs):
             entered.set()
             await asyncio.Event().wait()
-        self.client.ask.side_effect = ask
+        self.client.ask_stream.side_effect = ask
         commands = iter(("1", "A", "/cancel", "/wait", "/exit"))
         key = None
         def output(*args):
@@ -842,7 +952,7 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_first_cancel_during_usage_preserves_answer(self):
         rt = await self.setup_runtime()
-        self.client.ask.return_value = completion("已保存", "source")
+        self.client.ask_stream.return_value = completion("已保存", "source")
         entered, release = threading.Event(), self.gate(True)
         def usage(ids):
             entered.set()

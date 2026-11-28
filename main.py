@@ -94,6 +94,25 @@ async def select_session(list_sessions, select, create) -> str | None:
             print("请输入列表中的会话编号或命令。")
 
 
+async def watch(runtime: RuntimeManager, task_id: str) -> None:
+    """按 Step 展示临时正文，终态单独展示已提交的结果。"""
+    async for event in runtime.events(task_id):
+        data = event.data
+        if event.type == "llm/content_delta":
+            print(data["delta"], end="", flush=True)
+        elif event.type == "stream/gap":
+            print(f"\n[事件 {data['missing_from']}–{data['missing_to']} 已淘汰，临时输出有缺失]")
+        elif event.type == "task/end":
+            print(f"\n任务结束 {data['status']}")
+            print(data["error"] or data["answer"] or data["result"] or "")
+        elif event.type.startswith("task/"):
+            print(f"\n任务 {data['status']}")
+        elif event.type.startswith("tool/"):
+            print(f"\n{event.type} {data['name']} {data.get('status', '')}")
+        else:
+            print(f"\nTurn {data['turn']} · Step {data['step']} · {event.type} {data.get('finish_reason', '')}")
+
+
 async def main() -> None:
     """CLI 只持有当前 Session ID，提交任务后可继续选择其他会话。"""
     settings = load_compact_settings()
@@ -106,7 +125,7 @@ async def main() -> None:
             return
         await runtime.start()
         print("导游已就绪。/sessions 或 /switch 切换，/clear 新建，/compact 压缩，"
-              "/tasks 列表，/status、/wait、/result、/cancel 后接任务 ID，/exit 退出。")
+              "/tasks 列表，/status、/watch、/wait、/result、/cancel 后接任务 ID，/exit 退出。")
         while True:
             question = (await asyncio.to_thread(input, "你：")).strip()
             if not question:
@@ -129,6 +148,8 @@ async def main() -> None:
                         break
                 elif command == "/compact":
                     print(runtime.submit_compact(session_id))
+                elif command == "/watch":
+                    await watch(runtime, argument.strip())
                 elif command == "/cancel":
                     accepted = runtime.cancel(argument.strip())
                     print("已接受取消请求" if accepted else "任务已结束或正在取消")

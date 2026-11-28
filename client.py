@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Callable, Sequence
 
 from openai import AsyncOpenAI
 from openai.types.chat import ChatCompletion
@@ -143,6 +143,77 @@ class AsyncTripClient:
         options = self._request(messages, tools, tool_choice=tool_choice, temperature=temperature,
                                 max_tokens=max_tokens, response_format=response_format)
         return await self._api.chat.completions.create(**options)
+
+    async def ask_stream(
+        self, messages: Sequence[dict[str, Any]], tools: Sequence[dict[str, Any]] | None = None, *,
+        tool_choice: str | dict[str, Any] = "auto", temperature: float | None = None,
+        max_tokens: int | None = None, response_format: dict[str, Any] | None = None,
+        on_delta: Callable[[str], None] | None = None,
+    ) -> ChatCompletion:
+        """逐块发布正文，流结束且结构完整后才返回可提交的 Assistant 消息。"""
+        options = self._request(messages, tools, tool_choice=tool_choice, temperature=temperature,
+                                max_tokens=max_tokens, response_format=response_format)
+        options.update(stream=True, stream_options={"include_usage": True})
+        content, reasoning = [], []
+        calls = {}
+        first = role = finish = usage = None
+        stream = await self._api.chat.completions.create(**options)
+        async with stream:
+            async for chunk in stream:
+                if first is None:
+                    first = chunk
+                if chunk.usage is not None:
+                    usage = chunk.usage
+                for choice in chunk.choices:
+                    if choice.index != 0 or finish is not None:
+                        raise ValueError("模型返回了意外的流式 Choice")
+                    delta = choice.delta
+                    if delta.role is not None:
+                        if delta.role != "assistant":
+                            raise ValueError("流式消息角色无效")
+                        role = delta.role
+                    if delta.content is not None:
+                        content.append(delta.content)
+                        if delta.content and on_delta is not None:
+                            on_delta(delta.content)
+                    thought = getattr(delta, "reasoning_content", None)
+                    if thought is not None:
+                        reasoning.append(thought)
+                    for part in delta.tool_calls or []:
+                        if part.index < 0:
+                            raise ValueError("工具调用序号无效")
+                        call = calls.setdefault(part.index, {"function": {}})
+                        function = call["function"]
+                        if part.type is not None:
+                            call["type"] = part.type
+                        if part.id and call.get("id") != part.id:
+                            call["id"] = call.get("id", "") + part.id
+                        if part.function is not None:
+                            name = part.function.name
+                            if name and function.get("name") != name:
+                                function["name"] = function.get("name", "") + name
+                            if part.function.arguments is not None:
+                                function.setdefault("arguments", []).append(part.function.arguments)
+                    finish = choice.finish_reason
+
+        if first is None or role != "assistant" or finish not in {"stop", "tool_calls"}:
+            raise ValueError(f"模型响应未正常完成：{finish}")
+        if bool(calls) != (finish == "tool_calls"):
+            raise ValueError("结束原因与工具调用不一致")
+        message = {"role": role, "content": "".join(content) if content else None}
+        if reasoning:
+            message["reasoning_content"] = "".join(reasoning)
+        if calls:
+            message["tool_calls"] = [calls[index] for index in sorted(calls)]
+            for call in message["tool_calls"]:
+                function = call["function"]
+                if not function.get("name") or "arguments" not in function:
+                    raise ValueError("工具调用缺少函数名称或参数")
+                function["arguments"] = "".join(function["arguments"])
+        return ChatCompletion.model_validate({
+            "id": first.id, "object": "chat.completion", "created": first.created, "model": first.model,
+            "choices": [{"index": 0, "message": message, "finish_reason": finish}], "usage": usage,
+        })
 
     async def close(self) -> None:
         await self._api.close()

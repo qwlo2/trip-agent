@@ -5,6 +5,8 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Any
 
+from runtime.events import TaskEventBuffer
+
 
 class TaskKind(str, Enum):
     TURN = "turn"
@@ -27,6 +29,7 @@ class TaskRecord:
     kind: TaskKind
     question: str | None
     completion: asyncio.Future
+    events: TaskEventBuffer
     status: TaskStatus = TaskStatus.QUEUED
     task: asyncio.Task | None = None
     answer: str | None = None

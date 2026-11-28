@@ -58,6 +58,12 @@ VS Code 的默认 Python 解释器已配置为 `.venv/bin/python`。若仍提示
 `/sessions`、`/switch` 可在任务运行时切换会话，`/clear` 创建新会话并保留旧历史。
 `/exit`、`exit`、`quit` 或 EOF 会等待所有已接受的任务结束。
 
+用 `/watch <task_id>` 在当前终端订阅任务。每个 Step 单独显示模型生成的原始 JSON 片段和工具执行状态，
+任务结束时显示最终回答或错误。订阅期间 CLI 等待该任务结束再读取命令。
+程序可用 `async for event in runtime.events(task_id, after=seq)` 从上次读取的位置继续。
+每个任务在内存中保留最近 512 个事件，普通事件 payload 合计最多 256 KiB。慢订阅者通过
+`stream/gap` 得知遗漏范围，完整结果可从 `task/end` 或 `wait()` 获取。进程退出后这些事件随之释放。
+
 每个会话同时接受一个 Turn 或手动压缩。默认并发执行 4 个任务，最多接收 32 个排队和运行中的任务，
 保留最近 128 条终态记录。Turn 内按顺序执行工具，最多请求模型 30 步。
 
@@ -346,7 +352,10 @@ MCP 查询失败时，工具返回错误结果给模型；工具发现失败时�
 `AsyncTripClient.ask(messages, tools=None)` 接收外部工具列表，省略时为普通对话。
 
 `ask()` 发送一次请求，直接返回 SDK 原始 `ChatCompletion` 响应，不自动解析。
-`GuideAgent.ask()` 先将 `response.choices[0].message.model_dump(exclude_none=True)`
+前台 `GuideAgent.ask()` 使用 `ask_stream(..., on_delta=callback)`；压缩与后台记忆继续使用 `ask()`。
+同步回调只接收新增正文。Client 在完整响应中保留推理内容和按序聚合的工具参数。
+Session 历史仅提交完整消息，临时 Delta 只进入任务事件缓冲。
+Agent 将 `response.choices[0].message.model_dump(exclude_none=True)`
 通过 `Session.commit_event()` 提交到日志和当前上下文，然后根据以下字段处理回答或工具调用。
 
 - `role`：消息角色，LLM 返回的消息通常为 `assistant`。
@@ -361,7 +370,7 @@ MCP 查询失败时，工具返回错误结果给模型；工具发现失败时�
 
 AsyncTripClient 不执行工具、不维护对话历史、不自动重试。Agent 记录原始消息后，
 执行工具并追加带对应 `tool_call_id` 的
-`role="tool"` 消息，随后再次调用 `ask()`。`metadata["finish_reason"]` 为
+`role="tool"` 消息，随后再次调用 `ask_stream()`。`metadata["finish_reason"]` 为
 `length` 表示输出被截断，
 Agent 应检查结束原因；无效的工具参数 JSON 会直接抛出解析异常。
 网络和 API 错误保留 SDK 原始异常，由调用方处理。

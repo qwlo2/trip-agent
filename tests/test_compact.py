@@ -66,6 +66,12 @@ class FakeClient:
 
 
 class FakeAsyncClient(FakeClient):
+    async def ask_stream(self, messages, tools=None, *, on_delta=None, **options):
+        reply = super().ask(messages, tools, **options)
+        if on_delta and reply.choices[0].message.content:
+            on_delta(reply.choices[0].message.content)
+        return reply
+
     async def ask(self, messages, tools=None, **options):
         return super().ask(messages, tools, **options)
 

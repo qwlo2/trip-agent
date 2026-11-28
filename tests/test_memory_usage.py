@@ -179,7 +179,11 @@ class MemoryUsageTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_format_correction_within_loop(self):
         self.client.normal_responses = [response("   "), completion("已修正")]
-        self.assertEqual((await self.agent.ask("测试")), "已修正")
+        events = []
+        answer = await self.agent.ask("测试", emit=lambda name, data: events.append((name, data)))
+        self.assertEqual(answer, "已修正")
+        deltas = [(data["step"], data["delta"]) for name, data in events if name == "llm/content_delta"]
+        self.assertEqual(deltas, [(1, "   "), (2, completion("已修正").choices[0].message.content)])
         self.assertIn("格式无效", self.client.requests[1][0][-1]["content"])
         self.assertEqual(self.session.context.build()[-2]["content"], "   ")
         self.assertEqual(self.session.history.load("导游")[-1]["reason"], "completed")

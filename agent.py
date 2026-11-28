@@ -93,7 +93,7 @@ class GuideAgent:
             raise RuntimeError("当前上下文仍超出模型输入预算，无法安全缩减，请调整容量或保留策略")
         return messages
 
-    async def ask(self, question: str) -> str:
+    async def ask(self, question: str, *, emit=None) -> str:
         """独占一个 Session 完成 Turn；已提交的回答优先于后续取消。"""
         session = self.session
         session.require_usable()
@@ -110,20 +110,29 @@ class GuideAgent:
             retried_format = False
             for step in range(1, self.max_steps + 1):
                 location = {"turn": turn, "step": step}
+                def publish(event_type, **data):
+                    if emit is not None:
+                        emit(event_type, {**location, **data})
+
                 await blocking(commit, {"type": "step/start", **location})
+                publish("step/start")
                 await session.compact_if_needed()
                 messages = await blocking(self._request_messages, memory_prompt, tools, response_format, correction)
                 correction = None
-                response = await self.client.ask(messages, tools=tools, response_format=response_format,
-                                                 max_tokens=session.compact.max_output_tokens)
+                publish("llm/start")
+                response = await self.client.ask_stream(
+                    messages, tools=tools, response_format=response_format, max_tokens=session.compact.max_output_tokens,
+                    on_delta=(lambda delta: publish("llm/content_delta", delta=delta)) if emit is not None else None,
+                )
                 choice = response.choices[0]
                 message = choice.message.model_dump(exclude_none=True)
                 tool_call_ids(message)
+                publish("llm/end", finish_reason=choice.finish_reason)
                 usage = response.usage.model_dump() if response.usage is not None else None
                 await blocking(commit, {"type": "message", **location, "message": message, "usage": usage})
                 calls = message.get("tool_calls") or []
                 if calls:
-                    await self._run_tools(calls, choice.finish_reason, turn, step)
+                    await self._run_tools(calls, choice.finish_reason, turn, step, publish)
                 elif choice.finish_reason == "stop":
                     try:
                         answer, used_ids = parse_final_answer(message.get("content"))
@@ -135,6 +144,7 @@ class GuideAgent:
                 else:
                     raise RuntimeError(f"模型响应未正常完成：{choice.finish_reason}")
                 await blocking(commit, {"type": "step/end", **location})
+                publish("step/end")
                 if not calls and correction is None:
                     break
             else:
@@ -157,16 +167,19 @@ class GuideAgent:
                 logging.getLogger(__name__).warning("回答已保存，记忆 Usage 更新失败", exc_info=True)
         return answer
 
-    async def _run_tools(self, calls: list[dict[str, Any]], finish_reason: str, turn: int, step: int) -> None:
+    async def _run_tools(self, calls: list[dict[str, Any]], finish_reason: str, turn: int, step: int, publish) -> None:
         """顺序执行工具；严重故障直接隔离，普通失败仍配齐工具结果。"""
         error = None if finish_reason == "tool_calls" else RuntimeError(f"模型未完整返回工具调用：{finish_reason}")
         for raw in calls:
+            started = False
             name = raw["function"]["name"]
             if error is not None:
                 result = {"error": "同批工具调用失败，本调用已跳过"}
             else:
                 try:
                     call = AsyncTripClient.parse_tool_call(raw)
+                    publish("tool/start", name=name, tool_call_id=call.id)
+                    started = True
                     result = await self.executor.call_tool_async(name, call.arguments)
                 except SessionIntegrityError:
                     raise
@@ -177,5 +190,8 @@ class GuideAgent:
             message = {"role": "tool", "tool_call_id": raw["id"],
                        "content": await blocking(json.dumps, result, ensure_ascii=False, default=asdict)}
             await blocking(self.session.commit_event, {"type": "message", "turn": turn, "step": step, "message": message})
+            if started:
+                failed = isinstance(result, dict) and ("error" in result or result.get("isError") is True)
+                publish("tool/end", name=name, tool_call_id=raw["id"], status="failed" if failed else "completed")
         if error is not None:
             raise error

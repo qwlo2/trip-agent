@@ -30,6 +30,24 @@ memmory
 
     新增了RuntimeManager,SessionManager管理会话的职责删去，只负责持久化
 
+    LLM的流式输出：（展示思维链的同时将正文分批次传出）
+                非流式：
+                   http报文完整一次性传输
+                流式：
+                   body部分时server生成与传输同步传输，将其分为几个部分，采用SSE格式
+                
+                SSE：(event:自定义事件类型)
+                 id: 1
+                 event: llm_delta
+                 data: {"content":"杭州"}
+
+                 id: 2
+                 event: llm_delta
+                 data: {"content":"三日游"}
+
+        接下来会根据决策将整个链路整理一遍，再梳理是否冗余
+
+
     任务流转如下：
         listenfd接受fd，然后通过RuntimeManager获取session
         （它维持有session-id->GuideAgent ，每个GuideAgent的ageng可以改变，有独立的tool，后续可以做成多agent，同时也封装了task，多个task可以对应同一个session，但是独占写session）
