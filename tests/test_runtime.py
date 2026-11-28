@@ -130,10 +130,22 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(rt.list_tasks(), [])
         key = rt.submit(self.a, "A")
         old = rt._tasks[key]
-        old.task.cancel()
-        self.assertEqual((await self.wait_task(key))["status"], "failed")
+        with self.assertRaises(KeyError):
+            rt.cancel("missing")
+        self.assertTrue(rt.cancel(key))
+        self.assertEqual(rt.get_task(key)["status"], "cancelling")
+        self.assertFalse(rt.cancel(key))
+        result = await self.wait_task(key)
+        self.assertTrue(old.task.cancelled())
+        self.assertEqual(result["status"], "cancelled")
+        for field in ("answer", "result", "error"):
+            self.assertIsNone(result[field])
+        self.assertFalse(rt.cancel(key))
+        self.assertEqual(len(self.events(self.a)), 1)
+        self.client.ask.assert_not_awaited()
         new = rt.submit(self.a, "B")
         rt._done(old, old.task)
+        self.assertEqual(list(rt._completed).count(key), 1)
         self.assertEqual(rt._owners[self.a], new)
         self.assertEqual((await self.wait_task(new))["status"], "completed")
 
@@ -150,12 +162,18 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
         await asyncio.wait_for(entered.wait(), 5)
         b = rt.submit_compact(self.b)
         await asyncio.sleep(0)
-        rt._tasks[b].task.cancel()
-        self.assertEqual((await self.wait_task(b))["status"], "failed")
+        self.assertTrue(rt.cancel(b))
+        self.assertEqual((await self.wait_task(b))["status"], "cancelled")
+        self.assertTrue(rt._tasks[b].task.cancelled())
+        self.assertEqual(len(self.events(self.b)), 1)
         retry = rt.submit_compact(self.b)
-        rt._tasks[a].task.cancel()
-        self.assertEqual((await self.wait_task(a))["status"], "failed")
-        self.assertEqual(self.events(self.a)[-1]["reason"], "error")
+        self.assertTrue(rt.cancel(a))
+        self.assertEqual((await self.wait_task(a))["status"], "cancelled")
+        self.assertTrue(rt._tasks[a].task.cancelled())
+        self.assertEqual(self.events(self.a)[-1]["reason"], "cancelled")
+        with closing(get_connection()) as conn:
+            row = conn.execute("SELECT last_completed_seq,last_completed_at FROM stage1_outputs WHERE session_id=?", (self.a,)).fetchone()
+            self.assertEqual(tuple(row), (None, None))
         self.assertEqual((await self.wait_task(retry))["status"], "completed")
 
     async def test_repeated_cancel_during_message_write_keeps_owner_and_permit(self):
@@ -175,15 +193,18 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
             a = rt.submit(self.a, "A")
             self.assertTrue(await asyncio.to_thread(entered.wait, 5))
             b = rt.submit_compact(self.b)
-            for _ in range(2):
-                rt._tasks[a].task.cancel()
+            for expected in (True, False):
+                self.assertEqual(rt.cancel(a), expected)
                 await asyncio.sleep(0)
-                self.assertEqual(rt.get_task(a)["status"], "running")
+                self.assertEqual(rt.get_task(a)["status"], "cancelling")
                 self.assertEqual(rt.get_task(b)["status"], "queued")
                 with self.assertRaises(RuntimeError):
                     rt.submit_compact(self.a)
+            for operation in (rt.archive_session, rt.delete_session):
+                with self.assertRaises(RuntimeError):
+                    await operation(self.a)
             release.set()
-            self.assertEqual((await self.wait_task(a))["status"], "failed")
+            self.assertEqual((await self.wait_task(a))["status"], "cancelled")
             self.assertEqual((await self.wait_task(b))["status"], "completed")
         self.directory.load(self.a, self.client)
 
@@ -209,14 +230,16 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
                 patch.object(Phase2Store, "record_usage", side_effect=usage) as record, self.assertLogs("agent"):
             key = rt.submit(self.a, "A")
             self.assertTrue(await asyncio.to_thread(entered.wait, 5))
-            rt._tasks[key].task.cancel()
+            self.assertTrue(rt.cancel(key))
             release.set()
             self.assertTrue(await asyncio.to_thread(usage_entered.wait, 5))
-            rt._tasks[key].task.cancel()
+            self.assertFalse(rt.cancel(key))
             await asyncio.sleep(0)
-            self.assertEqual(rt.get_task(key)["status"], "running")
+            self.assertEqual(rt.get_task(key)["status"], "cancelling")
             usage_release.set()
             result = await self.wait_task(key)
+            self.assertTrue(rt._tasks[key].task.done())
+            self.assertFalse(rt._tasks[key].task.cancelled())
             self.assertEqual((result["status"], result["answer"]), ("completed", "已完成"))
             record.assert_called_once_with({"source"})
 
@@ -491,6 +514,13 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
             rt.submit(self.a, "冲突")
         b = rt.submit_compact(self.b)
         self.assertEqual(rt.get_task(b)["status"], "queued")
+        before = self.events(self.a)
+        self.assertTrue(rt.cancel(key))
+        cancelled = await self.wait_task(key)
+        self.assertEqual(cancelled["status"], "cancelled")
+        self.assertIsNone(cancelled["error"])
+        self.assertEqual(self.events(self.a), before)
+        key = rt.submit_compact(self.a)
         release.set()
         self.assertEqual((await self.wait_task(key))["result"].status, "compacted")
         self.assertEqual((await self.wait_task(b))["status"], "completed")
@@ -555,22 +585,30 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
     async def test_cancel_batch_after_tool_started_pairs_remaining_ids(self):
         rt = await self.setup_runtime(max_concurrent_tasks=1)
         await self.wait_task(rt.submit_compact(self.a))
+        rt._sessions[self.a].executor.register_tool("done", "test", {}, lambda: "saved")
         entered = asyncio.Event()
+        calls = []
         async def stall():
+            calls.append("stall")
             entered.set()
             await asyncio.Event().wait()
         rt._sessions[self.a].executor.register_tool("stall", "test", {}, stall, mode=ToolExecutionMode.ASYNC)
-        self.client.ask.return_value = response(None, calls=[tool_call("A", "stall"), tool_call("B", "stall")],
+        self.client.ask.return_value = response(None, calls=[tool_call("first", "done"), tool_call("A", "stall"), tool_call("B", "stall")],
                                                 finish="tool_calls")
         key = rt.submit(self.a, "A")
         await asyncio.wait_for(entered.wait(), 4)
-        rt._tasks[key].task.cancel()
-        self.assertEqual((await self.wait_task(key))["status"], "failed")
+        self.assertTrue(rt.cancel(key))
+        self.assertEqual((await self.wait_task(key))["status"], "cancelled")
         events = self.events(self.a)
-        self.assertEqual([e["message"]["tool_call_id"] for e in events if e.get("message", {}).get("role") == "tool"],
-                         ["A", "B"])
-        self.assertEqual(events[-1]["reason"], "error")
+        tools = [e["message"] for e in events if e.get("message", {}).get("role") == "tool"]
+        self.assertEqual(calls, ["stall"])
+        self.assertEqual([m["tool_call_id"] for m in tools], ["first", "A", "B"])
+        self.assertEqual([json.loads(m["content"]) for m in tools],
+                         ["saved", {"error": "本轮已中止"}, {"error": "本轮已中止"}])
+        self.assertEqual(events[-1]["reason"], "cancelled")
         self.directory.load(self.a, self.client)
+        self.client.ask.return_value = completion("继续")
+        self.assertEqual((await self.wait_task(rt.submit(self.a, "继续")))["answer"], "继续")
 
     async def test_load_lock_can_be_retried_and_activity_is_reconciled(self):
         rt = await self.setup_runtime()
@@ -647,7 +685,7 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
             with patch.object(compact, "commit_compaction", held):
                 key = rt.submit_compact(sid) if sid == self.a else rt.submit(sid, "请压缩")
                 self.assertTrue(await asyncio.to_thread(entered.wait, 4))
-                rt._tasks[key].task.cancel()
+                self.assertTrue(rt.cancel(key))
                 with self.assertRaises(RuntimeError):
                     rt.submit_compact(sid)
                 release.set()
@@ -656,8 +694,10 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(result["result"].summary_seq, self.events(sid)[-1]["seq"])
                 self.assertEqual(result["status"], "completed")
             else:
-                self.assertIn("CancelledError", result["error"])
-                self.assertEqual(self.events(sid)[-1]["reason"], "error")
+                self.assertEqual(result["status"], "cancelled")
+                self.assertIsNone(result["error"])
+                self.assertTrue(any(e["type"] == "compaction/summary" for e in self.events(sid)))
+                self.assertEqual(self.events(sid)[-1]["reason"], "cancelled")
                 self.directory.load(sid, self.client)
 
     async def test_direct_drain_cancel_preserves_completion_and_owner(self):
@@ -737,3 +777,82 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
             failed = await self.wait_task(rt.submit_compact(self.a))
         self.assertIn("ValueError: implementation fault", failed["error"])
         self.assertEqual((await self.wait_task(rt.submit(self.a, "A")))["status"], "completed")
+
+    async def test_cancel_during_shutdown_waits_for_failed_cleanup(self):
+        rt = await self.setup_runtime()
+        entered = asyncio.Event()
+        closing_step, release = threading.Event(), self.gate(True)
+        async def ask(*args, **kwargs):
+            entered.set()
+            await asyncio.Event().wait()
+        self.client.ask.side_effect = ask
+        append = HistoryStore.append
+        def fail_cleanup(history, events):
+            if events[0]["type"] == "step/end":
+                closing_step.set()
+                self.assertTrue(release.wait(4))
+                raise OSError("cleanup write failed")
+            return append(history, events)
+        with patch.object(HistoryStore, "append", fail_cleanup):
+            key = rt.submit(self.a, "A")
+            await asyncio.wait_for(entered.wait(), 4)
+            shutdown = asyncio.create_task(rt.shutdown())
+            await asyncio.sleep(0)
+            self.assertEqual(rt.state, RuntimeState.CLOSING)
+            self.assertTrue(rt.cancel(key))
+            self.assertTrue(await asyncio.to_thread(closing_step.wait, 4))
+            self.assertFalse(rt.cancel(key))
+            self.assertFalse(shutdown.done())
+            self.client.close.assert_not_awaited()
+            session = rt._sessions[self.a].session
+            release.set()
+            result = await self.wait_task(key)
+            self.assertEqual(result["status"], "failed")
+            self.assertIn("cleanup write failed", result["error"])
+            with self.assertRaises(SessionIntegrityError):
+                session.require_usable()
+            await asyncio.wait_for(shutdown, 4)
+        self.client.close.assert_awaited_once()
+
+    async def test_cli_cancel_and_wait(self):
+        import main
+        rt = await self.setup_runtime()
+        entered = threading.Event()
+        async def ask(*args, **kwargs):
+            entered.set()
+            await asyncio.Event().wait()
+        self.client.ask.side_effect = ask
+        commands = iter(("1", "A", "/cancel", "/wait", "/exit"))
+        key = None
+        def output(*args):
+            nonlocal key
+            if len(args) == 1 and isinstance(args[0], str) and len(args[0]) == 32:
+                key = args[0]
+        def read(prompt):
+            command = next(commands)
+            if command in {"/cancel", "/wait"}:
+                self.assertTrue(entered.wait(4))
+                return f"{command} {key}"
+            return command
+        with patch("main.RuntimeManager", return_value=rt), patch("builtins.input", read), \
+                patch("builtins.print", side_effect=output) as printed:
+            await asyncio.wait_for(main.main(), 6)
+        printed.assert_any_call("已接受取消请求")
+        printed.assert_any_call("cancelled")
+
+    async def test_first_cancel_during_usage_preserves_answer(self):
+        rt = await self.setup_runtime()
+        self.client.ask.return_value = completion("已保存", "source")
+        entered, release = threading.Event(), self.gate(True)
+        def usage(ids):
+            entered.set()
+            self.assertTrue(release.wait(4))
+        with patch.object(Phase2Store, "record_usage", side_effect=usage) as record:
+            key = rt.submit(self.a, "A")
+            self.assertTrue(await asyncio.to_thread(entered.wait, 4))
+            self.assertTrue(rt.cancel(key))
+            self.assertEqual(rt.get_task(key)["status"], "cancelling")
+            release.set()
+            result = await self.wait_task(key)
+        self.assertEqual((result["status"], result["answer"], result["error"]), ("completed", "已保存", None))
+        record.assert_called_once_with({"source"})

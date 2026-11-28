@@ -28,6 +28,7 @@ class RuntimeManager:
     def __init__(self, directory: SessionRepository, *, max_concurrent_tasks: int = 4,
                  max_pending_tasks: int = 32, max_completed_tasks: int = 128,
                  client_factory=AsyncTripClient, executor_factory=ToolExecutor):
+        """配置会话目录、客户端与工具执行器工厂，以及运行任务、未结束任务和保留记录的容量。"""
         if any(type(n) is not int or n < 1 for n in (max_concurrent_tasks, max_pending_tasks, max_completed_tasks)):
             raise ValueError("Runtime 容量必须为正整数")
         self._directory = directory
@@ -49,7 +50,7 @@ class RuntimeManager:
         self.state = RuntimeState.CREATED
 
     async def start(self) -> None:
-        """恢复本地摘要后启动唯一的后台记忆任务。"""
+        """绑定当前事件循环，初始化共享资源并恢复本地摘要，然后调度后台记忆任务。"""
         loop = asyncio.get_running_loop()
         if self.state == RuntimeState.RUNNING and loop is self._loop:
             return
@@ -70,29 +71,35 @@ class RuntimeManager:
             raise
 
     def _check_loop(self) -> None:
+        """确认调用发生在启动 Runtime 的事件循环中。"""
         if asyncio.get_running_loop() is not self._loop:
             raise RuntimeError("Runtime 必须由所属 Event Loop 访问")
 
     def _accepting(self) -> None:
+        """确认 Runtime 处于运行状态，可以接收新的前台任务或管理操作。"""
         self._check_loop()
         if self.state != RuntimeState.RUNNING:
             raise RuntimeError("Runtime 未接受新操作")
 
     def _check_idle(self, session_id: str) -> None:
+        """校验会话 ID，并拒绝操作已有所有者的会话。"""
         if not isinstance(session_id, str) or not session_id.strip():
             raise ValueError("Session ID 不能为空")
         if session_id in self._owners:
             raise RuntimeError("Session 已有已接受的任务")
 
     def submit(self, session_id: str, question: str) -> str:
+        """提交一轮导游问答，返回可用于查询或等待结果的任务 ID。"""
         if not isinstance(question, str) or not question.strip():
             raise ValueError("问题不能为空")
         return self._submit(session_id, TaskKind.TURN, question)
 
     def submit_compact(self, session_id: str) -> str:
+        """提交独立的会话压缩任务，返回任务 ID。"""
         return self._submit(session_id, TaskKind.COMPACT, None)
 
     def _submit(self, session_id, kind, question) -> str:
+        """校验会话和容量，登记任务及会话所有权，再调度执行。Task 创建失败时撤销登记。"""
         self._accepting()
         self._check_idle(session_id)
         if session_id in self._load_failures:
@@ -117,6 +124,7 @@ class RuntimeManager:
         return key
 
     async def _get_or_open(self, session_id: str) -> GuideAgent:
+        """返回已缓存的 Agent，或加载会话、初始化工具并缓存新 Agent。记录会话完整性故障以拒绝后续提交。"""
         if session_id not in self._sessions:
             try:
                 session = await blocking(self._directory.load, session_id, self._client)
@@ -129,54 +137,68 @@ class RuntimeManager:
         return self._sessions[session_id]
 
     async def _execute(self, record: TaskRecord) -> None:
+        """取得并发许可后执行问答或独立压缩并保存结果。退出时归还许可，执行异常传播至 Task。"""
         async with self._semaphore:
             record.status = TaskStatus.RUNNING
-            try:
-                agent = await self._get_or_open(record.session_id)
-                if record.kind == TaskKind.TURN:
-                    record.answer = await agent.ask(record.question)
-                else:
-                    record.result = await agent.session.compact_now(standalone=True)
-            except (Exception, asyncio.CancelledError) as exc:
-                self._finalize_once(record, exc)
+            agent = await self._get_or_open(record.session_id)
+            if record.kind == TaskKind.TURN:
+                record.answer = await agent.ask(record.question)
             else:
-                self._finalize_once(record, None)
+                record.result = await agent.session.compact_now(standalone=True)
 
-    def _done(self, record, task) -> None:
-        """包括第一次运行前、等待许可时被取消的路径。"""
-        error = asyncio.CancelledError() if task.cancelled() else task.exception()
-        self._finalize_once(record, error)
-
-    def _release(self, session_id, owner):
-        if self._owners.get(session_id) == owner:
-            del self._owners[session_id]
-
-    def _finalize_once(self, record, error) -> None:
+    def _done(self, record: TaskRecord, task: asyncio.Task) -> None:
+        """根据 Task 的实际结果发布终态，释放会话所有权，通知等待方并按容量回收最旧的记录。"""
         if record.completion.done():
             return
-        record.status = TaskStatus.COMPLETED if error is None else TaskStatus.FAILED
-        if error is not None:
-            record.error = f"{type(error).__name__}: {error}"
+        if task.cancelled():
+            record.status = TaskStatus.CANCELLED
+        else:
+            error = task.exception()
+            if error is None:
+                record.status = TaskStatus.COMPLETED
+            else:
+                record.status = TaskStatus.FAILED
+                record.error = f"{type(error).__name__}: {error}"
         self._release(record.session_id, record.task_id)
         record.completion.set_result(record.snapshot())
         self._completed.append(record.task_id)
         if len(self._completed) > self._max_completed:
             del self._tasks[self._completed.popleft()]
 
+    def _release(self, session_id, owner):
+        """仅在所有者 ID 匹配时释放会话，避免旧任务回调误释放新所有者。"""
+        if self._owners.get(session_id) == owner:
+            del self._owners[session_id]
+
+    def cancel(self, task_id: str) -> bool:
+        """请求取消已接受的前台任务。首次接受返回 True，正在取消或已结束时返回 False。"""
+        self._check_loop()
+        record = self._tasks[task_id]
+        if record.completion.done() or record.status == TaskStatus.CANCELLING:
+            return False
+        if not record.task.cancel():
+            return False
+        record.status = TaskStatus.CANCELLING
+        return True
+
     def get_task(self, task_id: str) -> dict:
+        """按 ID 获取任务当前状态与结果的快照。ID 不存在时抛出 KeyError。"""
         self._check_loop()
         return self._tasks[task_id].snapshot()
 
     def list_tasks(self) -> list[dict]:
+        """返回当前仍登记的所有前台任务快照，包含未结束任务和保留的终态任务。"""
         self._check_loop()
         return [record.snapshot() for record in self._tasks.values()]
 
     async def wait(self, task_id: str) -> dict:
+        """等待结束回调发布最终快照。取消等待方时，业务 Task 和结果 Future 仍独立运行。"""
         self._check_loop()
         return dict(await asyncio.shield(self._tasks[task_id].completion))
 
     @contextmanager
     def _manage(self, exclusive_id=None):
+        """登记会话管理操作供关闭流程等待。指定会话时独占它，并在操作退出后释放所有权。"""
         self._accepting()
         finished = self._loop.create_future()
         if exclusive_id is not None:
@@ -193,22 +215,27 @@ class RuntimeManager:
             finished.set_result(None)
 
     async def create_session(self, name: str) -> str:
+        """通过会话目录创建会话和初始日志，返回新会话 ID。"""
         with self._manage():
             return await blocking(self._directory.create, name)
 
     async def list_sessions(self, **page) -> list[dict]:
+        """按传入的 limit 和 offset 查询未归档会话，结果按使用次数排序。"""
         with self._manage():
             return await blocking(self._directory.list_sessions, **page)
 
     async def select_session(self, session_id: str) -> str:
+        """记录指定会话被打开，增加使用次数并返回会话 ID。"""
         with self._manage():
             return await blocking(self._directory.record_open, session_id)
 
     async def archive_session(self, session_id: str, archived: bool = True) -> bool:
+        """独占会话并设置归档或恢复状态，返回归档标记是否实际改变。"""
         with self._manage(session_id):
             return await blocking(self._directory.archive, session_id, archived)
 
     async def delete_session(self, session_id: str) -> bool:
+        """独占会话并提交目录删除，随后清理日志和缓存。返回目录中是否找到该会话。"""
         with self._manage(session_id):
             try:
                 deleted = await blocking(self._directory.delete, session_id, finish_on_cancel=True)
@@ -225,12 +252,14 @@ class RuntimeManager:
             return deleted
 
     def _forget_deleted(self, session_id):
+        """移除已删除会话的 Agent 和故障记录，并禁用仍被引用的旧会话对象。"""
         agent = self._sessions.pop(session_id, None)
         if agent:
             agent.session.failure_reason = "会话目录已删除"
         self._load_failures.pop(session_id, None)
 
     async def shutdown(self) -> None:
+        """停止接收新操作和后台领取，等待共享关闭任务排空工作。取消等待方时关闭仍继续。"""
         if self.state == RuntimeState.CREATED:
             if self._loop is not None:
                 raise RuntimeError("启动尚未完成")
@@ -246,6 +275,7 @@ class RuntimeManager:
         await asyncio.shield(self._closing)
 
     async def _drain(self) -> None:
+        """等待前台任务最终化、管理操作及后台记忆任务结束，再清理缓存并关闭共享客户端。"""
         await wait_finished(asyncio.gather(*(r.completion for r in self._tasks.values()), *self._management,
                                            self._memory_task, return_exceptions=True),
                             finish_on_cancel=True)

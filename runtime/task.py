@@ -14,6 +14,8 @@ class TaskKind(str, Enum):
 class TaskStatus(str, Enum):
     QUEUED = "queued"
     RUNNING = "running"
+    CANCELLING = "cancelling"
+    CANCELLED = "cancelled"
     COMPLETED = "completed"
     FAILED = "failed"
 

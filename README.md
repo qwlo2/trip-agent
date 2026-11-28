@@ -49,6 +49,10 @@ VS Code 的默认 Python 解释器已配置为 `.venv/bin/python`。若仍提示
 
 启动时每页展示最多 25 个未归档会话，按打开次数降序排列。
 输入编号打开会话，输入 `0` 新建，使用 `n` 和 `p` 翻页。
+使用 `/cancel <task_id>` 请求取消前台问答或独立压缩，使用 `/wait <task_id>` 等待最终结果。
+清理期间状态为 `cancelling`，Session 保持独占。正常取消后为 `cancelled`，已提交的历史会保留。
+若已进入最终回答或独立摘要的持久化提交，成功后仍返回 `completed`；提交或清理出错则返回 `failed`。
+
 输入问题或 `/compact` 后立即得到任务 ID。用 `/tasks` 查看列表、`/status <id>` 查看状态、
 `/wait <id>` 等待结果或 `/result <id>` 查看回答及错误。
 `/sessions`、`/switch` 可在任务运行时切换会话，`/clear` 创建新会话并保留旧历史。
@@ -141,7 +145,7 @@ asyncio.run(run_trip())
 {"type":"turn/end","turn":1,"reason":"completed","seq":6}
 ```
 
-`turn/end.reason` 为 `TurnEndReason`：`completed`、`error` 或 `max_steps`。
+`turn/end.reason` 为 `TurnEndReason`：`completed`、`error`、`max_steps` 或 `cancelled`。
 对于已登记的会话，`completed` 的 `turn/end` 成功写入日志后，才用其 `seq` 更新
 `stage1_outputs.last_completed_seq`。其他结束原因保留在日志中。
 重新打开会话会从日志补录遗漏的正常结束记录，补录时间以日志文件的修改时间估算。

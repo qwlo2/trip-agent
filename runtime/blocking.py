@@ -24,6 +24,8 @@ async def wait_finished(work: asyncio.Future[T], *, finish_on_cancel: bool = Fal
 
 
 async def blocking(operation: Callable[..., T], *args, finish_on_cancel: bool = False, **kwargs) -> T:
-    """使用默认执行器，取消不能中断 worker 或提前释放 Session。"""
+    """使用默认执行器，取消信息不能中断 worker 或提前释放 Session。
+       semaphore如果不封装，cancel时会提前释放
+    """
     work = asyncio.get_running_loop().run_in_executor(None, partial(operation, *args, **kwargs))
     return await wait_finished(work, finish_on_cancel=finish_on_cancel)

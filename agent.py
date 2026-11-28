@@ -143,7 +143,9 @@ class GuideAgent:
             await blocking(commit, {"type": "turn/end", "turn": turn, "reason": "completed"}, finish_on_cancel=True)
         except SessionIntegrityError:
             raise
-        except (Exception, asyncio.CancelledError):
+        except (Exception, asyncio.CancelledError) as exc:
+            if isinstance(exc, asyncio.CancelledError):
+                reason = TurnEndReason.CANCELLED
             if session.failure_reason is None:
                 await blocking(session.close_failed_turn, turn, reason, finish_on_cancel=True)
             raise

@@ -17,11 +17,12 @@ class SessionIntegrityError(RuntimeError):
 
 
 class TurnEndReason(str, Enum):
-    """问答结束原因：正常完成、执行异常或达到步骤上限。"""
+    """问答结束原因：正常完成、执行异常、达到步骤上限或取消。"""
 
     COMPLETED = "completed"
     ERROR = "error"
     MAX_STEPS = "max_steps"
+    CANCELLED = "cancelled"
 
 
 class HistoryStore:

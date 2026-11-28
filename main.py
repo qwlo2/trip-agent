@@ -106,7 +106,7 @@ async def main() -> None:
             return
         await runtime.start()
         print("导游已就绪。/sessions 或 /switch 切换，/clear 新建，/compact 压缩，"
-              "/tasks 列表，/status、/wait、/result 后接任务 ID，/exit 退出。")
+              "/tasks 列表，/status、/wait、/result、/cancel 后接任务 ID，/exit 退出。")
         while True:
             question = (await asyncio.to_thread(input, "你：")).strip()
             if not question:
@@ -129,6 +129,9 @@ async def main() -> None:
                         break
                 elif command == "/compact":
                     print(runtime.submit_compact(session_id))
+                elif command == "/cancel":
+                    accepted = runtime.cancel(argument.strip())
+                    print("已接受取消请求" if accepted else "任务已结束或正在取消")
                 elif command == "/tasks":
                     for item in runtime.list_tasks():
                         print(item["task_id"], item["session_id"], item["kind"], item["status"])
