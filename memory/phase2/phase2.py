@@ -90,7 +90,7 @@ class Phase2Agent:
         paths = get_data_paths()
         await blocking(paths.ensure_directories)
         store = Phase2Store()
-        # 工作区锁覆盖模型请求与 Git 提交，避免租约过期时两个进程同时写文件。
+        # 工作区锁覆盖模型请求与 Git 提交。
         def acquire(stack):
             directory = os.open(paths.memories, os.O_RDONLY | os.O_DIRECTORY)
             stack.callback(os.close, directory)

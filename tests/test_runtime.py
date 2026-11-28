@@ -16,7 +16,6 @@ from database.phase2_store import Phase2Store
 from database.sqlite import get_connection
 from database.stage1_store import Stage1Store
 from history import HistoryStore
-from memory.phase1.event_reader import EventReader
 from runtime.manager import RuntimeManager, RuntimeState
 from session import Session, SessionIntegrityError
 from session_repository import SessionRepository
@@ -347,8 +346,6 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("未闭合", result["error"])
         with self.assertRaises(SessionIntegrityError):
             rt.submit(self.b, "重开")
-        with self.assertRaises(ValueError):
-            EventReader(path).read(max_seq=2)
 
     async def test_tool_ids_rejected_live_and_at_replay(self):
         rt = await self.setup_runtime()

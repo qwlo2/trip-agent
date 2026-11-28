@@ -5,6 +5,7 @@ import json
 import os
 import sqlite3
 import time
+import threading
 import unittest
 from contextlib import closing
 from tempfile import TemporaryDirectory
@@ -13,7 +14,7 @@ from unittest.mock import patch
 from agent import GuideAgent, parse_final_answer
 from data_paths import get_data_paths
 from database.phase2_store import Phase2Store
-from database.sqlite import get_connection
+from database.sqlite import get_connection, init_database, recover_interrupted_jobs
 from database.stage1_store import Stage1Store
 from memory.reader import search_memory, truncate_middle_with_token_budget, turn_memory_prompt
 from memory.search import MAX_CONTENT, MAX_MATCHES, MAX_OUTPUT_BYTES
@@ -375,13 +376,13 @@ class MemoryUsageTests(unittest.IsolatedAsyncioTestCase):
         store = Stage1Store()
         store.record_turn_end("Z", 11, int(time.time()))
         store.set_memory_enabled(self.session.session_id, False)
-        claim = store.claim_stage1(scan_limit=20, max_running=1, max_age_days=1, min_idle_seconds=0,
-                                   lease_seconds=600, max_attempts=1)
+        claim = store.claim_stage1(scan_limit=20, max_age_days=1, min_idle_seconds=0,
+                                   max_attempts=1)
         self.assertEqual(claim.session_id, "Z")
         self.assertTrue(store.commit_stage1_result("Z", 11, "更新摘要", "new", claim.ownership_token))
         self.assertEqual(self.usage("Z")[0], 1)
         claim2 = Phase2Store().claim(limit=1, active_days=1, interval=60, max_retries=1)
-        self.assertEqual([(m.session_id, m.source_seq) for m in claim2.memories], [("Z", 11)])
+        self.assertEqual([(m.session_id, m.summary) for m in claim2.memories], [("Z", "更新摘要")])
 
     async def test_memory_pipeline_keeps_its_own_response_contracts(self):
         self.client.normal_responses = [completion("乘坐公交"), response('{"action":"replace","summary":"偏好公交"}')]
@@ -411,8 +412,8 @@ class MemoryUsageTests(unittest.IsolatedAsyncioTestCase):
         store = Stage1Store()
         sid = self.session.session_id
         now = int(time.time())
-        options = dict(scan_limit=10, max_running=1, max_age_days=1, min_idle_seconds=0,
-                       lease_seconds=60, max_attempts=3)
+        options = dict(scan_limit=10, max_age_days=1, min_idle_seconds=0,
+                       max_attempts=3)
         def job():
             with closing(get_connection()) as conn:
                 return dict(conn.execute("SELECT * FROM memory_jobs WHERE kind='stage1'").fetchone())
@@ -430,7 +431,7 @@ class MemoryUsageTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(store.commit_stage1_result(sid, 120, "stale", "", claim.ownership_token))
         self.assertTrue(store.commit_stage1_result(sid, 120, "实际输入", "", retry.ownership_token))
         row = job()
-        self.assertEqual((row["input_version"], row["last_success_version"], row["status"]), (120,120,"pending"))
+        self.assertEqual((row["input_version"], row["status"]), (120,"pending"))
         next_claim = store.claim_stage1(**options)
         self.assertFalse(store.fail_stage1(retry, "old", retry_delay_seconds=0))
         store.set_memory_enabled(sid, False)
@@ -449,8 +450,8 @@ class MemoryUsageTests(unittest.IsolatedAsyncioTestCase):
                                               message={"role":"user","content":str(seq)})])
         reader = EventReader(self.session.history.path)
         store = Stage1Store()
-        options = dict(scan_limit=10, max_running=1, max_age_days=1, min_idle_seconds=0,
-                       lease_seconds=60, max_attempts=3)
+        options = dict(scan_limit=10, max_age_days=1, min_idle_seconds=0,
+                       max_attempts=3)
         store.record_turn_end(sid, 2, int(time.time()))
         claim = store.claim_stage1(**options)
         self.assertEqual([e.seq for e in reader.read(claim=claim)], [1])
@@ -484,7 +485,7 @@ class MemoryUsageTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("新摘要", await manager.prompt())
         with closing(get_connection()) as conn, conn:
             job = conn.execute("SELECT * FROM memory_jobs WHERE kind='phase2'").fetchone()
-            self.assertEqual((job["status"], job["last_success_version"], job["input_version"]), ("pending",0,1))
+            self.assertEqual((job["status"], job["claimed_version"], job["input_version"]), ("pending",None,1))
             conn.execute("UPDATE memory_jobs SET started_at=0 WHERE kind='phase2'")
             conn.execute("UPDATE stage1_outputs SET rollout_summary='改变' WHERE session_id='A'")
         git = phase2._git
@@ -520,25 +521,25 @@ class MemoryUsageTests(unittest.IsolatedAsyncioTestCase):
         await manager.recover()
         self.assertEqual(self.path.read_text().strip(), "已提交")
         with closing(get_connection()) as conn, conn:
-            row = conn.execute("SELECT status,last_success_version FROM memory_jobs WHERE kind='phase2'").fetchone()
-            self.assertEqual(tuple(row), ("running", None))
-            conn.execute("UPDATE memory_jobs SET started_at=0,lease_until=0 WHERE kind='phase2'")
+            row = conn.execute("SELECT status,claimed_version FROM memory_jobs WHERE kind='phase2'").fetchone()
+            self.assertEqual(row["status"], "running")
+            self.assertIsNotNone(row["claimed_version"])
+            conn.execute("UPDATE memory_jobs SET started_at=0 WHERE kind='phase2'")
         self.assertEqual(await manager.run(), "unchanged")
 
-    def test_expired_stage1_lease_only_loses_ownership_on_reclaim(self):
+    def test_interrupted_stage1_recovery_invalidates_owner(self):
         store = Stage1Store()
         sid = self.session.session_id
-        options = dict(scan_limit=10, max_running=1, max_age_days=1, min_idle_seconds=0,
-                       lease_seconds=60, max_attempts=3)
+        options = dict(scan_limit=10, max_age_days=1, min_idle_seconds=0,
+                       max_attempts=3)
         store.record_turn_end(sid, 10, int(time.time()))
         first = store.claim_stage1(**options)
-        with closing(get_connection()) as conn, conn:
-            conn.execute("UPDATE memory_jobs SET lease_until=0 WHERE kind='stage1'")
+        self.assertIsNone(store.claim_stage1(**options))
         self.assertTrue(store.commit_stage1_result(sid, 10, "保留摘要", "", first.ownership_token))
         store.record_turn_end(sid, 20, int(time.time()))
         expired = store.claim_stage1(**options)
-        with closing(get_connection()) as conn, conn:
-            conn.execute("UPDATE memory_jobs SET lease_until=0 WHERE kind='stage1'")
+        self.assertIsNone(store.claim_stage1(**options))
+        recover_interrupted_jobs(0)
         current = store.claim_stage1(**options)
         self.assertNotEqual(current.ownership_token, expired.ownership_token)
         self.assertFalse(store.fail_stage1(expired, "offline", retry_delay_seconds=0))
@@ -586,12 +587,12 @@ class MemoryUsageTests(unittest.IsolatedAsyncioTestCase):
                 release.set()
             self.assertEqual(await asyncio.wait_for(task, 4), {sid:"committed"})
         model.assert_awaited_once()
-        self.assertIsNone(claim(scan_limit=10, max_running=1, max_age_days=1, min_idle_seconds=1800,
-                                lease_seconds=60, max_attempts=3))
+        self.assertIsNone(claim(scan_limit=10, max_age_days=1, min_idle_seconds=1800,
+                                max_attempts=3))
         with closing(get_connection()) as conn:
-            row = conn.execute("""SELECT last_completed_seq,source_max_seq,input_version,last_success_version,status
+            row = conn.execute("""SELECT last_completed_seq,source_max_seq,input_version,status
                                   FROM stage1_outputs JOIN memory_jobs ON job_key=session_id WHERE kind='stage1'""").fetchone()
-            self.assertEqual(tuple(row), (6,4,4,4,"pending"))
+            self.assertEqual(tuple(row), (6,4,4,"pending"))
 
     async def test_initial_repo_recovery_and_uncertain_git_commit(self):
         from memory.phase2 import phase2
@@ -621,8 +622,8 @@ class MemoryUsageTests(unittest.IsolatedAsyncioTestCase):
         sid = self.session.session_id
         store = Stage1Store()
         now = int(time.time())
-        options = dict(scan_limit=10, max_running=1, max_age_days=1, min_idle_seconds=0,
-                       lease_seconds=60, max_attempts=3)
+        options = dict(scan_limit=10, max_age_days=1, min_idle_seconds=0,
+                       max_attempts=3)
 
         def complete(turn, content):
             events = self.session.history.append([
@@ -661,3 +662,117 @@ class MemoryUsageTests(unittest.IsolatedAsyncioTestCase):
         with closing(get_connection()) as conn:
             self.assertEqual(tuple(conn.execute(
                 "SELECT input_version,retry_remaining FROM memory_jobs WHERE kind='stage1'").fetchone()), (6, 2))
+
+    def test_schema_is_idempotent_and_constrained(self):
+        self.seed()
+        init_database()
+        with closing(get_connection()) as conn, conn:
+            def columns(table):
+                return [row["name"] for row in conn.execute(f"PRAGMA table_info({table})")]
+            self.assertEqual(columns("memory_jobs"), [
+                "kind", "job_key", "status", "input_version", "claimed_version", "ownership_token",
+                "retry_at", "retry_remaining", "last_error", "started_at", "finished_at", "updated_at",
+            ])
+            self.assertEqual(columns("stage1_outputs"), [
+                "session_id", "last_completed_seq", "last_completed_at", "source_max_seq", "rollout_summary",
+                "rollout_slug", "generated_at", "usage_count", "last_usage", "allow_global",
+            ])
+            self.assertEqual(conn.execute("SELECT source_max_seq FROM stage1_outputs WHERE session_id='A'").fetchone()[0], 10)
+            for assignment in ("source_max_seq=11", "allow_global=2"):
+                with self.assertRaises(sqlite3.IntegrityError):
+                    conn.execute(f"UPDATE stage1_outputs SET {assignment} WHERE session_id='A'")
+            insert = "INSERT INTO memory_jobs(kind,job_key,status,updated_at) VALUES (?,'job',?,0)"
+            conn.execute(insert, ("stage1", "done"))
+            for values in (("stage1","done"), ("unknown","done"), ("phase2","unknown")):
+                with self.assertRaises(sqlite3.IntegrityError):
+                    conn.execute(insert, values)
+
+    def test_recovery_preserves_versions_backoff_and_cooldown(self):
+        with closing(get_connection()) as conn, conn:
+            conn.executemany("""INSERT INTO memory_jobs(kind, job_key, status, ownership_token, input_version,
+                             claimed_version,retry_remaining,started_at,updated_at)
+                             VALUES (?, ?, 'running','old',8,?,0,900,900)""",
+                             [("stage1","A",None), ("phase2","global",8)])
+        with patch("database.sqlite.time.time", return_value=1000):
+            recover_interrupted_jobs(60)
+        with patch("database.sqlite.time.time", return_value=2000):
+            recover_interrupted_jobs(60)
+        with closing(get_connection()) as conn:
+            rows = conn.execute("""SELECT kind,status,ownership_token,input_version,claimed_version,retry_remaining,
+                                started_at,finished_at,updated_at,retry_at,last_error FROM memory_jobs ORDER BY kind""")
+            self.assertEqual([tuple(row) for row in rows], [
+                ("phase2","error",None,8,8,0,900,1000,1000,None,"Interrupted"),
+                ("stage1","error",None,8,None,0,900,1000,1000,1060,"Interrupted"),
+            ])
+        store = Phase2Store()
+        options = dict(limit=1, active_days=1, interval=21600, max_retries=3)
+        with patch("database.phase2_store.time.time", return_value=22500):
+            self.assertIsNone(store.claim(**options))
+        Stage1Store().set_allow_global(self.session.session_id, False)
+        with patch("database.phase2_store.time.time", return_value=22499):
+            self.assertIsNone(store.claim(**options))
+        with patch("database.phase2_store.time.time", return_value=22500):
+            self.assertEqual(store.claim(**options).input_version, 9)
+
+    async def test_failed_recovery_skips_both_phases(self):
+        manager = MemoryManager(self.client, asyncio.Lock(), load_config())
+        with patch("memory.memory_maneger.recover_interrupted_jobs", side_effect=sqlite3.OperationalError("private")), \
+                patch.object(manager._phase1, "run") as first, patch.object(manager._phase2, "run") as second, \
+                self.assertLogs("memory.memory_maneger") as logs:
+            await manager.run()
+        first.assert_not_awaited()
+        second.assert_not_awaited()
+        self.assertIn("OperationalError", logs.output[0])
+        self.assertNotIn("private", logs.output[0])
+
+    async def test_cancel_during_claim_leaves_recoverable_job(self):
+        sid = self.session.session_id
+        Stage1Store().record_turn_end(sid, 10, int(time.time()))
+        entered, release = threading.Event(), threading.Event()
+        claim = Stage1Store.claim_stage1
+
+        def held(store, **options):
+            result = claim(store, **options)
+            self.assertIsNotNone(result)
+            entered.set()
+            self.assertTrue(release.wait(5))
+            return result
+
+        manager = MemoryManager(self.client, asyncio.Lock(), load_config())
+        with patch.dict(os.environ, MEMORY_PHASE1_MIN_IDLE_SECONDS="0"), patch.object(Stage1Store, "claim_stage1", held):
+            task = asyncio.create_task(manager.run())
+            try:
+                self.assertTrue(await asyncio.to_thread(entered.wait, 4))
+                task.cancel()
+                await asyncio.sleep(0)
+                self.assertFalse(task.done())
+            finally:
+                release.set()
+            with self.assertRaises(asyncio.CancelledError):
+                await asyncio.wait_for(task, 4)
+
+        with closing(get_connection()) as conn:
+            self.assertEqual(conn.execute("SELECT status FROM memory_jobs WHERE kind='stage1'").fetchone()[0], "running")
+        await manager.run()
+        with closing(get_connection()) as conn:
+            row = conn.execute("SELECT status,last_error,retry_remaining FROM memory_jobs WHERE kind='stage1'").fetchone()
+            self.assertEqual(tuple(row), ("error", "Interrupted", 2))
+
+    async def test_phase1_processes_two_sessions_per_round(self):
+        from memory.phase1.phase1 import Phase1Agent
+        ids = {self.manager.create(name) for name in ("甲", "乙", "丙")}
+        for sid in ids:
+            session = self.manager.load(sid, self.client)
+            session.history.append([
+                {"type": "message", "turn": 1, "message": {"role": "user", "content": "想游杭州"}},
+                {"type": "turn/end", "turn": 1, "reason": "completed"},
+            ])
+            Stage1Store().record_turn_end(sid, 2, int(time.time()))
+        self.client.summary_response = response('{"rollout_summary":"杭州","rollout_slug":"hangzhou"}')
+        agent = Phase1Agent(self.client)
+        with patch.dict(os.environ, MEMORY_PHASE1_MIN_IDLE_SECONDS="0"):
+            first = await agent.run(asyncio.Event())
+            second = await agent.run(asyncio.Event())
+        self.assertEqual((len(first), len(second)), (2, 1))
+        self.assertEqual(set(first) | set(second), ids)
+        self.assertEqual(set(first.values()) | set(second.values()), {"committed"})

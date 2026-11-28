@@ -105,6 +105,7 @@ asyncio.run(run_trip())
 ```
 
 `SessionRepository` 管理目录。用户选择会话时增加使用次数，Runtime 首次执行任务时独占加载并验证日志。
+同一数据目录及 SQLite 数据库只允许一个 Runtime 执行 Memory Pipeline。每轮开始时，后台任务将遗留的 running 记录标为中断，并保留版本及剩余重试额度。
 后台记忆任务立即扫描，串行执行 Phase 1、Phase 2，每轮结束后默认等待 120 秒。Phase 1 默认选择空闲至少 1800 秒的会话。
 运行期间通过 Runtime 的创建、选择、分页、归档和删除接口访问目录。删除先提交 SQLite，再清理日志。
 命令行从 `sessions` 表列出已登记的会话。

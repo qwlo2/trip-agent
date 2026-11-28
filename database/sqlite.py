@@ -1,4 +1,5 @@
 import sqlite3
+import time
 from contextlib import closing
 from pathlib import Path
 
@@ -17,18 +18,21 @@ def get_connection() -> sqlite3.Connection:
 
 
 def init_database() -> None:
-    """初始化数据库，并在已有会话表中补齐 Phase 1 的筛选字段。"""
+    """初始化数据目录及数据库表结构。"""
     get_data_paths().ensure_directories()
     schema = SCHEMA_PATH.read_text(encoding="utf-8")
     with closing(get_connection()) as conn:
         conn.executescript(schema)
-        with conn:
-            conn.execute("BEGIN IMMEDIATE")
-            columns = {row["name"] for row in conn.execute("PRAGMA table_info(sessions)")}
-            if "updated_at" not in columns:
-                conn.execute("ALTER TABLE sessions ADD COLUMN updated_at INTEGER")
-            if "memory_enabled" not in columns:
-                conn.execute(
-                    "ALTER TABLE sessions ADD COLUMN memory_enabled INTEGER NOT NULL DEFAULT 1 "
-                    "CHECK (memory_enabled IN (0, 1))"
-                )
+
+
+def recover_interrupted_jobs(retry_delay_seconds: int) -> None:
+    """在单执行者开始下一轮前结束遗留的领取，保留其重试额度。"""
+    now = int(time.time())
+    with closing(get_connection()) as conn, conn:
+        conn.execute("""
+            UPDATE memory_jobs SET status='error', ownership_token=NULL,
+                claimed_version=CASE WHEN kind='phase2' THEN claimed_version END,
+                retry_at=CASE WHEN kind='stage1' THEN ? END,
+                last_error='Interrupted', finished_at=?, updated_at=?
+            WHERE status='running'
+        """, (now + retry_delay_seconds, now, now))

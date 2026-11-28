@@ -34,14 +34,12 @@ class Stage1Store:
         self,
         *,
         scan_limit: int,
-        max_running: int,
         max_age_days: int,
         min_idle_seconds: int,
-        lease_seconds: int,
         max_attempts: int,
         excluded_sessions: tuple[str, ...] = (),
     ) -> Stage1Claim | None:
-        """原子领取最近的待处理会话；活跃租约和处于退避的同一版本不重复领取。"""
+        """原子领取最近的待处理会话；执行中和处于退避的同一版本不重复领取。"""
         placeholders = ",".join("?" for _ in excluded_sessions)
         exclude = f"AND c.session_id NOT IN ({placeholders})" if excluded_sessions else ""
         with closing(get_connection()) as conn, conn:
@@ -67,19 +65,16 @@ class Stage1Store:
                 FROM eligible AS c
                 LEFT JOIN memory_jobs AS j ON j.kind = 'stage1' AND j.job_key = c.session_id
                 WHERE (c.source_max_seq IS NULL OR c.source_max_seq < c.last_completed_seq)
-                  AND (j.last_success_version IS NULL OR j.last_success_version < c.last_completed_seq)
-                  AND (j.status IS NULL OR j.status <> 'running' OR j.lease_until <= ?)
+                  AND (j.status IS NULL OR j.status <> 'running')
                   AND (j.job_key IS NULL OR j.status = 'pending'
                        OR c.last_completed_seq > j.input_version
                        OR (j.retry_remaining > 0 AND COALESCE(j.retry_at, 0) <= ?))
-                  AND (SELECT COUNT(*) FROM memory_jobs
-                       WHERE kind = 'stage1' AND status = 'running' AND lease_until > ?) < ?
                   {exclude}
                 ORDER BY c.activity DESC, c.session_id
                 LIMIT 1
                 """,
                 (now - max_age_days * 86400, now - min_idle_seconds,
-                 scan_limit, max_attempts, now, now, now, max_running, *excluded_sessions),
+                 scan_limit, max_attempts, now, *excluded_sessions),
             ).fetchone()
             if row is None:
                 return None
@@ -91,19 +86,19 @@ class Stage1Store:
                 """
                 INSERT INTO memory_jobs (
                     kind, job_key, status, input_version, claimed_version, ownership_token,
-                    lease_until, retry_remaining, started_at, updated_at
-                ) VALUES ('stage1', ?, 'running', ?, NULL, ?, ?, ?, ?, ?)
+                    retry_remaining, started_at, updated_at
+                ) VALUES ('stage1', ?, 'running', ?, NULL, ?, ?, ?, ?)
                 ON CONFLICT (kind, job_key) DO UPDATE SET
                     status = 'running', input_version = excluded.input_version,
                     claimed_version = excluded.claimed_version,
                     ownership_token = excluded.ownership_token,
-                    lease_until = excluded.lease_until, retry_at = NULL,
+                    retry_at = NULL,
                     retry_remaining = excluded.retry_remaining, last_error = NULL,
                     started_at = excluded.started_at, finished_at = NULL,
                     updated_at = excluded.updated_at
                 """,
                 (claim.session_id, row["last_completed_seq"], claim.ownership_token,
-                 now + lease_seconds, row["attempts"] - 1, now, now),
+                 row["attempts"] - 1, now, now),
             )
             return claim
 
@@ -115,7 +110,7 @@ class Stage1Store:
                 """
                 UPDATE memory_jobs
                 SET status = 'error', claimed_version = NULL, ownership_token = NULL,
-                    lease_until = NULL, retry_at = ?, last_error = ?, finished_at = ?, updated_at = ?
+                    retry_at = ?, last_error = ?, finished_at = ?, updated_at = ?
                 WHERE kind = 'stage1' AND job_key = ? AND status = 'running'
                   AND ownership_token = ?
                 """,
@@ -145,11 +140,12 @@ class Stage1Store:
                 (enabled, session_id, enabled),
             )
             if cursor.rowcount:
-                conn.execute(_ADVANCE_PHASE2_SQL, (int(time.time()),))
+                now = int(time.time())
+                conn.execute(_ADVANCE_PHASE2_SQL, (now,))
                 if not enabled:
                     conn.execute("""UPDATE memory_jobs SET status='pending', ownership_token=NULL,
-                                 claimed_version=NULL, lease_until=NULL WHERE kind='stage1'
-                                 AND job_key=? AND status='running'""", (session_id,))
+                                 claimed_version=NULL, finished_at=?, updated_at=? WHERE kind='stage1'
+                                 AND job_key=? AND status='running'""", (now, now, session_id))
             return cursor.rowcount == 1
 
     def record_turn_end(
@@ -226,12 +222,12 @@ class Stage1Store:
             conn.execute(
                 """
                 UPDATE memory_jobs
-                SET last_success_version = ?, input_version = ?, status = ?,
-                    claimed_version = NULL, ownership_token = NULL, lease_until = NULL,
+                SET input_version = ?, status = ?,
+                    claimed_version = NULL, ownership_token = NULL,
                     retry_at = NULL, last_error = NULL, finished_at = ?, updated_at = ?
                 WHERE kind = 'stage1' AND job_key = ?
                 """,
-                (source_seq, source_seq, status, now, now, session_id),
+                (source_seq, status, now, now, session_id),
             )
             if previous["allow_global"] and (previous["rollout_summary"] or summary):
                 conn.execute(_ADVANCE_PHASE2_SQL, (now,))

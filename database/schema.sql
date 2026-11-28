@@ -40,23 +40,12 @@ CREATE TABLE IF NOT EXISTS stage1_outputs (
     allow_global INTEGER NOT NULL DEFAULT 1
         CHECK (allow_global IN (0, 1)),
 
-    -- 最近一次成功整合的来源状态
-    selected_for_phase2 INTEGER NOT NULL DEFAULT 0
-        CHECK (selected_for_phase2 IN (0, 1)),
-
-    selected_for_phase2_source_max_seq INTEGER,
-
     CHECK (
         source_max_seq IS NULL
         OR (
             last_completed_seq IS NOT NULL
             AND source_max_seq <= last_completed_seq
         )
-    ),
-
-    CHECK (
-        selected_for_phase2 = 1
-        OR selected_for_phase2_source_max_seq IS NULL
     )
 );
 
@@ -90,11 +79,9 @@ CREATE TABLE IF NOT EXISTS memory_jobs (
     -- 版本控制
     input_version INTEGER NOT NULL DEFAULT 0,
     claimed_version INTEGER,
-    last_success_version INTEGER,
 
     -- 执行所有权
     ownership_token TEXT,
-    lease_until INTEGER,
 
     -- 失败重试
     retry_at INTEGER,
@@ -107,12 +94,4 @@ CREATE TABLE IF NOT EXISTS memory_jobs (
     updated_at INTEGER NOT NULL,
 
     PRIMARY KEY (kind, job_key)
-);
-
-CREATE INDEX IF NOT EXISTS idx_memory_jobs_claim
-ON memory_jobs(
-    kind,
-    status,
-    retry_at,
-    lease_until
 );

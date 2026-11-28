@@ -130,7 +130,8 @@ class DataPathsTests(unittest.TestCase):
         get_data_paths.cache_clear()
         manager = SessionRepository("system", settings)
         self.assertEqual(manager.load(session_id, None).history.get(1)["message"]["content"], "你好")
-        self.assertEqual(EventReader.for_session(session_id, log_path=log_path).read()[-1].seq, 1)
+        claim = Stage1Store().claim_stage1(scan_limit=10, max_age_days=1, min_idle_seconds=0, max_attempts=3)
+        self.assertEqual(EventReader.for_session(session_id, log_path=log_path).read(claim=claim)[-1].seq, 1)
         with closing(get_connection()) as conn:
             row = conn.execute(
                 "SELECT rollout_summary FROM stage1_outputs WHERE session_id = ?", (session_id,),

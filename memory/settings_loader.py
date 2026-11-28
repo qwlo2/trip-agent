@@ -13,7 +13,6 @@ _ENV_KEYS = {
     "scan_limit": "MEMORY_PHASE1_SCAN_LIMIT",
     "max_age_days": "MEMORY_PHASE1_MAX_AGE_DAYS",
     "min_idle_seconds": "MEMORY_PHASE1_MIN_IDLE_SECONDS",
-    "lease_seconds": "MEMORY_PHASE1_LEASE_SECONDS",
     "max_attempts": "MEMORY_PHASE1_MAX_ATTEMPTS",
     "retry_delay_seconds": "MEMORY_PHASE1_RETRY_DELAY_SECONDS",
     "max_output_tokens": "MEMORY_PHASE1_MAX_OUTPUT_TOKENS",

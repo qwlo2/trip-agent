@@ -3,6 +3,7 @@
 import asyncio
 import logging
 
+from database.sqlite import recover_interrupted_jobs
 from memory.phase1.phase1 import Phase1Agent
 from memory.phase2.phase2 import Phase2Agent
 from memory.reader import turn_memory_prompt
@@ -14,6 +15,7 @@ class MemoryManager:
         self._phase1 = Phase1Agent(client)
         self._phase2 = Phase2Agent(client, lock, config)
         self._interval = config["scan_interval_seconds"]
+        self._retry_delay = config["retry_delay_seconds"]
         self._stopped = asyncio.Event()
 
     async def recover(self):
@@ -28,6 +30,13 @@ class MemoryManager:
             return await blocking(turn_memory_prompt, self._phase2.trusted)
 
     async def run(self):
+        if self._stopped.is_set():
+            return
+        try:
+            await blocking(recover_interrupted_jobs, self._retry_delay)
+        except Exception as exc:
+            logging.getLogger(__name__).warning("记忆任务恢复失败（%s）", type(exc).__name__)
+            return
         for phase in (self._phase1, self._phase2):
             if self._stopped.is_set():
                 break

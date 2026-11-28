@@ -95,9 +95,9 @@ class Phase1Agent:
             if stopped.is_set():
                 break
             claim = await blocking(store.claim_stage1,
-                scan_limit=config["scan_limit"], max_running=config["max_sessions"],
+                scan_limit=config["scan_limit"],
                 max_age_days=config["max_age_days"], min_idle_seconds=config["min_idle_seconds"],
-                lease_seconds=config["lease_seconds"], max_attempts=config["max_attempts"],
+                max_attempts=config["max_attempts"],
                 excluded_sessions=tuple(outcomes),
             )
             if claim is None:

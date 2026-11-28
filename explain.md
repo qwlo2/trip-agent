@@ -222,7 +222,7 @@ phase1：
 
       完善了session-maneger和追加last_completed_seq，接下来完善phase1.py
 
-       memory_jobs表是phase1，2的任务控制，用来判断是否成功以及限制只有一个worker进行提取
+       memory_jobs 记录两个阶段的领取凭证、版本及重试额度。每个数据目录由一个 Runtime 串行执行记忆任务，每轮开始时将遗留的 running 记录标记为 Interrupted。
  
   phase2：
    llm提取记忆时，会返回被引用得session，在增加stage1_outputs得usage
